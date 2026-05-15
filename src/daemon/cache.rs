@@ -23,6 +23,33 @@ struct CacheEntry {
     decrypted_path: PathBuf,
 }
 
+/// 上一次 `get(rel_key)` 走的路径。`Meta::cache_mode_per_shard` 的数据源；
+/// 也方便排查"为什么这次请求慢" —— `FullDecrypt` 是 ~120s 级、`WalIncremental` 是 <10s
+/// 级、`CacheHit` 是 ~0ms。
+///
+/// 注意 `as_str()` 返回的是 snake_case 字符串，CLI/Meta 序列化时直接塞这个字符串，
+/// 不要把 enum 自己 derive Serialize —— 这是和 `MetaStatus` 一样的约定，避免 Display
+/// 形态被 serde 默认行为悄悄改掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Path 1：主 .db + WAL mtime 都未变 → 直接用 cached 解密产物
+    CacheHit,
+    /// Path 2：主 .db 未变、WAL mtime 变了 → 在 cached 产物上增量 apply_wal
+    WalIncremental,
+    /// Path 3：主 .db mtime 变了 / 缓存 miss → 重新 full_decrypt + apply_wal
+    FullDecrypt,
+}
+
+impl CacheMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheMode::CacheHit => "cache_hit",
+            CacheMode::WalIncremental => "wal_incremental",
+            CacheMode::FullDecrypt => "full_decrypt",
+        }
+    }
+}
+
 /// 解密后数据库的 mtime-aware 缓存
 ///
 /// 当数据库文件（.db）或 WAL 文件（.db-wal）的 mtime 发生变化时，
@@ -33,6 +60,9 @@ pub struct DbCache {
     mtime_file: PathBuf,
     all_keys: HashMap<String, String>, // rel_key -> enc_key(hex)
     inner: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    /// 上一次 `get(rel_key)` 实际走了哪条路径；q_* 拿来填 `Meta::cache_mode_per_shard`。
+    /// 不持久化（重启后重新填），独立 Mutex 避免和 inner 抢锁。
+    last_modes: Arc<Mutex<HashMap<String, CacheMode>>>,
 }
 
 impl DbCache {
@@ -58,6 +88,7 @@ impl DbCache {
             mtime_file,
             all_keys,
             inner: Arc::new(Mutex::new(HashMap::new())),
+            last_modes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         cache.load_persistent().await;
@@ -68,6 +99,22 @@ impl DbCache {
     /// 上层（attachment resolver）需要 `db_dir.parent()` 来定位 `msg/attach/...` 解密图片。
     pub fn db_dir(&self) -> &Path {
         &self.db_dir
+    }
+
+    /// 上一次 `get(rel_key)` 走的 cache 路径。
+    /// 没有 get() 过这个 key 就返回 `None`，不退化到 `CacheHit` —— 调用方需要靠 `None`
+    /// 区分"没碰过"和"命中了 cache"。
+    ///
+    /// 典型用法：q_* 在跑完一轮 shard 扫描后，把每个被 `db.get(rel_key)` 过的分片的
+    /// `last_mode` 收进 `Meta::cache_mode_per_shard`。
+    pub async fn last_mode(&self, rel_key: &str) -> Option<CacheMode> {
+        self.last_modes.lock().await.get(rel_key).copied()
+    }
+
+    /// 内部：原子地记录某个 rel_key 这次走了哪条路径。
+    /// 单独抽出来是为了在 get() 里 3 个分支调用点都看得清——而不是散在 println!() 旁边。
+    async fn stamp_mode(&self, rel_key: &str, mode: CacheMode) {
+        self.last_modes.lock().await.insert(rel_key.to_string(), mode);
     }
 
     fn cache_file_path(&self, rel_key: &str) -> PathBuf {
@@ -177,6 +224,7 @@ impl DbCache {
         if let Some(entry) = cached.as_ref() {
             if entry.db_mtime == db_mt && entry.decrypted_path.exists() {
                 if entry.wal_mtime == wal_mt {
+                    self.stamp_mode(rel_key, CacheMode::CacheHit).await;
                     return Ok(Some(entry.decrypted_path.clone()));
                 }
 
@@ -202,6 +250,7 @@ impl DbCache {
                         decrypted_path: out_path.clone(),
                     });
                 }
+                self.stamp_mode(rel_key, CacheMode::WalIncremental).await;
                 self.save_persistent().await;
                 return Ok(Some(out_path));
             }
@@ -236,6 +285,7 @@ impl DbCache {
                 decrypted_path: out_path.clone(),
             });
         }
+        self.stamp_mode(rel_key, CacheMode::FullDecrypt).await;
 
         self.save_persistent().await;
         Ok(Some(out_path))
@@ -440,6 +490,65 @@ mod tests {
             "expected full_decrypt to rewrite cached file to PAGE_SZ multiple, got size={}",
             new_size,
         );
+    }
+
+    #[tokio::test]
+    async fn last_mode_records_each_path() {
+        // 单个 helper 同时验证三条路径都正确 stamp，避免拆三个 test 重复 setup。
+        let root = unique_tmpdir("lastmode");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, b"fake encrypted db").unwrap();
+        let wal_path = wal_path_for(&db_path);
+        std::fs::write(&wal_path, [0u8; 31]).unwrap();
+
+        let cached_hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
+        let decrypted_path = cache_dir.join(format!("{}.db", cached_hash));
+        std::fs::write(&decrypted_path, ORIGINAL_CACHED_BYTES).unwrap();
+
+        let db_mt = mtime_nanos(&db_path);
+        let wal_mt0 = mtime_nanos(&wal_path);
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let payload = serde_json::to_string(&serde_json::json!({
+            &rel_key: {
+                "db_mt": db_mt,
+                "wal_mt": wal_mt0,
+                "path": decrypted_path.display().to_string(),
+            }
+        }))
+        .unwrap();
+        std::fs::write(&mtime_file, payload).unwrap();
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), FAKE_KEY_HEX.to_string());
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        // 没碰过 → None（不是 CacheHit 的 default）
+        assert!(cache.last_mode(&rel_key).await.is_none(),
+            "未 get() 过的 key 应返回 None");
+
+        // Path 1: 完全 hit
+        cache.get(&rel_key).await.unwrap();
+        assert_eq!(cache.last_mode(&rel_key).await, Some(CacheMode::CacheHit));
+
+        // Path 2: bump WAL → WAL 增量
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&wal_path, [0xffu8; 31]).unwrap();
+        cache.get(&rel_key).await.unwrap();
+        assert_eq!(cache.last_mode(&rel_key).await, Some(CacheMode::WalIncremental));
+
+        // Path 3: bump 主 .db → 全量解密
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&db_path, b"different bytes").unwrap();
+        cache.get(&rel_key).await.unwrap();
+        assert_eq!(cache.last_mode(&rel_key).await, Some(CacheMode::FullDecrypt));
     }
 
     #[tokio::test]
