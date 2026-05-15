@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod meta;
 pub mod query;
 pub mod server;
 
