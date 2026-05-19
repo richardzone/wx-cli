@@ -55,6 +55,8 @@ pub struct Names {
     pub md5_to_uname: HashMap<String, String>,
     /// 消息 DB 的相对路径列表（message/message_N.db）
     pub msg_db_keys: Vec<String>,
+    /// 公众号推送 DB 的相对路径列表（message/biz_message_N.db）
+    pub biz_msg_db_keys: Vec<String>,
     /// username -> contact.verify_flag（0=真人，非 0 通常为公众号/服务号/认证账号）
     pub verify_flags: HashMap<String, i64>,
 }
@@ -269,6 +271,7 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
         map,
         md5_to_uname,
         msg_db_keys: Vec::new(),
+        biz_msg_db_keys: Vec::new(),
         verify_flags,
     })
 }
@@ -4010,7 +4013,7 @@ fn extract_cdata(xml: &str, tag: &str) -> Option<String> {
     }
 }
 
-/// 查询公众号文章推送（biz_message_0.db）
+/// 查询公众号文章推送（biz_message_*.db 分片）
 ///
 /// 每条消息可能包含多篇文章（多图文推送）。返回所有文章展开就的平底列表。
 pub async fn q_biz_articles(
@@ -4022,10 +4025,17 @@ pub async fn q_biz_articles(
     until: Option<i64>,
     unread: bool,
 ) -> Result<Value> {
-    let biz_path = db
-        .get("message/biz_message_0.db")
-        .await?
-        .context("无法解密 biz_message_0.db，请确认 all_keys.json 包含对应密钥")?;
+    let mut biz_paths = Vec::new();
+    for rel_key in &names.biz_msg_db_keys {
+        if let Some(path) = db.get(rel_key).await? {
+            biz_paths.push(path);
+        }
+    }
+    if biz_paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "无法解密任何 biz_message_*.db，请确认 all_keys.json 包含对应密钥"
+        ));
+    }
 
     // 开启 --unread：从 session.db 拿“公众号 + unread_count>0”的 username 子集，
     // 作为合集过滤（与 --account 取交集），后续结果按 account_username 去重取顶 1 篇。
@@ -4060,32 +4070,37 @@ pub async fn q_biz_articles(
         None
     };
 
-    // 1. 从 Name2Id 表获取 rowid -> username 映射，再推导 md5 -> username
-    let biz_path2 = biz_path.clone();
-    let id2username: HashMap<i64, String> = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&biz_path2)?;
-        let mut stmt =
-            conn.prepare("SELECT rowid, user_name FROM Name2Id WHERE user_name LIKE 'gh_%'")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok::<_, anyhow::Error>(rows.into_iter().collect())
+    // 1. 从全部 biz shard 的 Name2Id 表收集 username，再推导 md5 -> username
+    let biz_paths2 = biz_paths.clone();
+    let biz_usernames: HashSet<String> = tokio::task::spawn_blocking(move || {
+        let mut usernames = HashSet::new();
+        for biz_path in biz_paths2 {
+            let conn = Connection::open(&biz_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT user_name FROM Name2Id \
+                 WHERE user_name IS NOT NULL AND user_name != ''",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            usernames.extend(rows);
+        }
+        Ok::<_, anyhow::Error>(usernames)
     })
     .await??;
 
     // 构建 md5(username) -> username 映射
-    let md5_to_uname: HashMap<String, String> = id2username
-        .values()
+    let md5_to_uname: HashMap<String, String> = biz_usernames
+        .iter()
         .map(|u| (format!("{:x}", md5::compute(u.as_bytes())), u.clone()))
         .collect();
 
     // 2. 如果 指定了 --account，找到匹配的 username 列表
     let account_low = account.as_deref().map(|s| s.to_lowercase());
     let mut target_usernames: Option<Vec<String>> = account_low.as_ref().map(|low| {
-        id2username
-            .values()
+        biz_usernames
+            .iter()
             .filter(|u| {
                 let display = names.display(u);
                 display.to_lowercase().contains(low.as_str())
@@ -4115,7 +4130,7 @@ pub async fn q_biz_articles(
     }
 
     // 3. 进行数据库查询
-    let biz_path3 = biz_path.clone();
+    let biz_paths3 = biz_paths;
     let since2 = since;
     let until2 = until;
     let target_hashes: Option<Vec<String>> = target_usernames.as_ref().map(|unames| {
@@ -4126,71 +4141,72 @@ pub async fn q_biz_articles(
     });
 
     let rows: Vec<(String, i64, i64, Vec<u8>, i64)> = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&biz_path3)?;
-
-        // 列出所有 Msg_<hash> 表
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")?;
-        let table_names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
         let re = regex::Regex::new(r"^Msg_[0-9a-f]{32}$").unwrap();
         let mut all_rows: Vec<(String, i64, i64, Vec<u8>, i64)> = Vec::new();
 
-        for tname in &table_names {
-            if !re.is_match(tname) {
-                continue;
-            }
-            let hash = &tname[4..];
+        for biz_path in biz_paths3 {
+            let conn = Connection::open(&biz_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+            )?;
+            let table_names: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
 
-            // account 过滤
-            if let Some(ref hashes) = target_hashes {
-                if !hashes.iter().any(|h| h == hash) {
+            for tname in &table_names {
+                if !re.is_match(tname) {
                     continue;
                 }
-            }
+                let hash = &tname[4..];
 
-            let username = md5_to_uname.get(hash).cloned().unwrap_or_default();
+                // account 过滤
+                if let Some(ref hashes) = target_hashes {
+                    if !hashes.iter().any(|h| h == hash) {
+                        continue;
+                    }
+                }
 
-            // 构建过滤条件
-            let mut clauses: Vec<String> = Vec::new();
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            // local_type & 0xFFFFFFFF = 49 是 appmsg（公众号文章）
-            clauses.push("(local_type & 4294967295) = 49".to_string());
-            if let Some(s) = since2 {
-                clauses.push("create_time >= ?".to_string());
-                params.push(Box::new(s));
-            }
-            if let Some(u) = until2 {
-                clauses.push("create_time <= ?".to_string());
-                params.push(Box::new(u));
-            }
-            let where_clause = format!("WHERE {}", clauses.join(" AND "));
+                let username = md5_to_uname.get(hash).cloned().unwrap_or_default();
 
-            let sql = format!(
-                "SELECT create_time, WCDB_CT_message_content, message_content \
-                 FROM [{}] {} ORDER BY create_time DESC",
-                tname, where_clause
-            );
+                // 构建过滤条件
+                let mut clauses: Vec<String> = Vec::new();
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                // local_type & 0xFFFFFFFF = 49 是 appmsg（公众号文章）
+                clauses.push("(local_type & 4294967295) = 49".to_string());
+                if let Some(s) = since2 {
+                    clauses.push("create_time >= ?".to_string());
+                    params.push(Box::new(s));
+                }
+                if let Some(u) = until2 {
+                    clauses.push("create_time <= ?".to_string());
+                    params.push(Box::new(u));
+                }
+                let where_clause = format!("WHERE {}", clauses.join(" AND "));
 
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            if let Ok(mut inner_stmt) = conn.prepare(&sql) {
-                let msg_rows: Vec<_> = inner_stmt
-                    .query_map(params_ref.as_slice(), |row| {
-                        Ok((
-                            username.clone(),
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1).unwrap_or(0),
-                            get_content_bytes(row, 2),
-                            0i64,
-                        ))
-                    })
-                    .map(|it| it.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default();
-                all_rows.extend(msg_rows);
+                let sql = format!(
+                    "SELECT create_time, WCDB_CT_message_content, message_content \
+                     FROM [{}] {} ORDER BY create_time DESC",
+                    tname, where_clause
+                );
+
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                if let Ok(mut inner_stmt) = conn.prepare(&sql) {
+                    let msg_rows: Vec<_> = inner_stmt
+                        .query_map(params_ref.as_slice(), |row| {
+                            Ok((
+                                username.clone(),
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1).unwrap_or(0),
+                                get_content_bytes(row, 2),
+                                0i64,
+                            ))
+                        })
+                        .map(|it| it.filter_map(|r| r.ok()).collect())
+                        .unwrap_or_default();
+                    all_rows.extend(msg_rows);
+                }
             }
         }
         Ok::<_, anyhow::Error>(all_rows)

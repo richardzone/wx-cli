@@ -9,6 +9,39 @@ use std::sync::Arc;
 
 use crate::config;
 
+fn normalized_rel_key(rel_key: &str) -> String {
+    rel_key.replace('\\', "/")
+}
+
+fn is_msg_db_key(rel_key: &str) -> bool {
+    let rel_key = normalized_rel_key(rel_key);
+    rel_key.starts_with("message/message_")
+        && rel_key.ends_with(".db")
+        && !rel_key.contains("_fts")
+        && !rel_key.contains("_resource")
+}
+
+fn is_biz_msg_db_key(rel_key: &str) -> bool {
+    let rel_key = normalized_rel_key(rel_key);
+    rel_key.starts_with("message/biz_message_")
+        && rel_key.ends_with(".db")
+        && !rel_key.contains("_fts")
+        && !rel_key.contains("_resource")
+}
+
+fn collect_db_keys(
+    all_keys: &HashMap<String, String>,
+    predicate: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut keys: Vec<String> = all_keys
+        .keys()
+        .filter(|k| predicate(k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
 /// daemon 入口
 ///
 /// 当 WX_DAEMON_MODE 环境变量设置时，main() 调用此函数
@@ -49,17 +82,8 @@ async fn async_run() -> Result<()> {
     let db = Arc::new(cache::DbCache::new(cfg.db_dir.clone(), all_keys.clone()).await?);
 
     // 收集消息 DB 列表
-    let msg_db_keys: Vec<String> = all_keys
-        .keys()
-        .filter(|k| {
-            let k = k.replace('\\', "/");
-            k.contains("message/message_")
-                && k.ends_with(".db")
-                && !k.contains("_fts")
-                && !k.contains("_resource")
-        })
-        .cloned()
-        .collect();
+    let msg_db_keys = collect_db_keys(&all_keys, is_msg_db_key);
+    let biz_msg_db_keys = collect_db_keys(&all_keys, is_biz_msg_db_key);
 
     // 预热：加载联系人 + 解密 session.db
     eprintln!("[daemon] 预热...");
@@ -69,11 +93,13 @@ async fn async_run() -> Result<()> {
             map: HashMap::new(),
             md5_to_uname: HashMap::new(),
             msg_db_keys: Vec::new(),
+            biz_msg_db_keys: Vec::new(),
             verify_flags: HashMap::new(),
         }
     });
     let mut names = names_raw;
     names.msg_db_keys = msg_db_keys;
+    names.biz_msg_db_keys = biz_msg_db_keys;
 
     let _ = db.get("session/session.db").await;
     let _ = db.get("sns/sns.db").await;
@@ -148,4 +174,29 @@ fn cleanup_and_exit() {
 fn cleanup_ipc_files() {
     let _ = std::fs::remove_file(config::sock_path());
     let _ = std::fs::remove_file(config::pid_path());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_biz_msg_db_key, is_msg_db_key};
+
+    #[test]
+    fn message_db_key_filter_ignores_biz_and_auxiliary_files() {
+        assert!(is_msg_db_key("message/message_0.db"));
+        assert!(is_msg_db_key("message\\message_12.db"));
+        assert!(!is_msg_db_key("message/biz_message_0.db"));
+        assert!(!is_msg_db_key("message/message_0.db-wal"));
+        assert!(!is_msg_db_key("message/message_0_fts.db"));
+        assert!(!is_msg_db_key("message/message_0_resource.db"));
+    }
+
+    #[test]
+    fn biz_message_db_key_filter_matches_only_biz_shards() {
+        assert!(is_biz_msg_db_key("message/biz_message_0.db"));
+        assert!(is_biz_msg_db_key("message\\biz_message_3.db"));
+        assert!(!is_biz_msg_db_key("message/message_0.db"));
+        assert!(!is_biz_msg_db_key("message/biz_message_0.db-wal"));
+        assert!(!is_biz_msg_db_key("message/biz_message_0_fts.db"));
+        assert!(!is_biz_msg_db_key("message/biz_message_0_resource.db"));
+    }
 }

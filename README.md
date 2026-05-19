@@ -217,7 +217,7 @@ wx sns-search "婚礼" --user "李四" --since 2023-01-01
 
 ### 公众号文章
 
-公众号文章推送存在独立的 `biz_message_0.db`，用 `biz-articles` 单独查：
+公众号文章推送存在独立的 `biz_message_*.db` 分片，用 `biz-articles` 单独查：
 
 ```bash
 wx biz-articles                                   # 最近 50 篇

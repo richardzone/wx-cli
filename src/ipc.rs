@@ -126,7 +126,7 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         user: Option<String>,
     },
-    /// 查询公众号文章推送（biz_message_0.db）
+    /// 查询公众号文章推送（biz_message_*.db 分片）
     BizArticles {
         #[serde(default = "default_limit_50")]
         limit: usize,
