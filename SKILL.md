@@ -111,6 +111,29 @@ sudo wx init
 
 初始化完成后，后续所有命令无需 `sudo`，daemon 在首次调用时自动启动。
 
+### 可选：多个微信 App / 多账号 profile
+
+大多数用户只运行一个微信，继续使用上面的 `sudo wx init` 和普通命令即可。
+只有当用户明确同时运行多个不同的微信 app bundle 时，才使用 `--profile` 隔离配置、密钥、daemon 和缓存。
+
+示例：
+
+```bash
+sudo wx --profile main init --app /Applications/WeChat.app
+sudo wx --profile second init --app /Applications/WeChat2.app
+
+wx --profile main sessions
+wx --profile second sessions
+```
+
+也可以按 bundle id 初始化：
+
+```bash
+sudo wx --profile second init --bundle-id com.tencent.xinWeChat2
+```
+
+`WeChat2.app` 只是双开场景示例；实际 app 路径和 bundle id 取决于用户自己的双开方式。
+
 ---
 
 ## 命令速查
@@ -360,6 +383,8 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 ├── daemon.pid / .log
 └── cache/            # 解密后的数据库缓存
 ```
+
+使用 `--profile` 时，数据位于 `~/.wx-cli/profiles/<profile>/`；未传 `--profile` 时仍使用默认的 `~/.wx-cli/`。
 
 ---
 
