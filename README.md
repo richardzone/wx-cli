@@ -143,6 +143,30 @@ wx sessions
 
 能看到最近会话即表示一切正常。daemon 在首次调用时自动启动。
 
+### 双开微信 / 多账号 profile
+
+macOS 上如果同时运行 `/Applications/WeChat.app` 和 `/Applications/WeChat2.app`，
+两个主进程都叫 `WeChat`，需要用 profile 把配置、密钥、daemon socket 和缓存隔离开：
+
+```bash
+# 主微信（com.tencent.xinWeChat）
+sudo wx --profile main init --app /Applications/WeChat.app
+wx --profile main sessions
+
+# 第二个微信（com.tencent.xinWeChat2）
+sudo wx --profile second init --app /Applications/WeChat2.app
+wx --profile second sessions
+```
+
+也可以直接按 bundle id 初始化：
+
+```bash
+sudo wx --profile second init --bundle-id com.tencent.xinWeChat2
+```
+
+profile 数据保存在 `~/.wx-cli/profiles/<profile>/`；未传 `--profile` 时仍使用旧的
+`~/.wx-cli/`，保持兼容。
+
 ---
 
 ## 命令
@@ -326,6 +350,7 @@ wx (CLI) ──Unix socket──▶ wx-daemon (后台进程)
 ```
 
 daemon 首次解密后将数据库和 mtime 持久化到 `~/.wx-cli/cache/`。重启后 mtime 未变则直接复用，无需重解密。
+如果使用了 `--profile`，对应状态位于 `~/.wx-cli/profiles/<profile>/`。
 
 ```
 ~/.wx-cli/

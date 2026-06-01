@@ -1,11 +1,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -20,18 +20,26 @@ pub struct KeyEntry {
     pub salt: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    pub process_name: Option<String>,
+    pub bundle_id: Option<String>,
+    pub app_path: Option<PathBuf>,
+}
+
 /// 从进程内存中扫描所有 SQLCipher 密钥
 ///
 /// 需要以 root/Administrator 权限运行
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
+pub fn scan_keys(db_dir: &Path, opts: &ScanOptions) -> Result<Vec<KeyEntry>> {
     #[cfg(target_os = "macos")]
-    return macos::scan_keys(db_dir);
+    return macos::scan_keys(db_dir, opts);
     #[cfg(target_os = "linux")]
-    return linux::scan_keys(db_dir);
+    return linux::scan_keys(db_dir, opts);
     #[cfg(target_os = "windows")]
-    return windows::scan_keys(db_dir);
+    return windows::scan_keys(db_dir, opts);
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
+        let _ = opts;
         anyhow::bail!("当前平台不支持自动密钥扫描")
     }
 }
@@ -92,7 +100,11 @@ mod tests {
     fn make_temp_dir(label: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         // 用 label + thread id 保证同进程内并发测试不冲突
-        p.push(format!("wx-cli-test-{}-{:?}", label, std::thread::current().id()));
+        p.push(format!(
+            "wx-cli-test-{}-{:?}",
+            label,
+            std::thread::current().id()
+        ));
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -118,8 +130,8 @@ mod tests {
         let path = dir.join("enc.db");
         // 非 SQLite 头 → 视为加密数据库，取前 16 字节作为 salt
         let header: [u8; 16] = [
-            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c,
         ];
         fs::write(&path, &header).unwrap();
 
@@ -214,7 +226,7 @@ mod tests {
     fn test_collect_db_salts_ignores_non_db_extensions() {
         let dir = make_temp_dir("collect-ext");
         let header = [0xbbu8; 16];
-        fs::write(dir.join("data.txt"),  &header).unwrap();
+        fs::write(dir.join("data.txt"), &header).unwrap();
         fs::write(dir.join("data.json"), &header).unwrap();
         fs::write(dir.join("data.sqlite"), &header).unwrap();
 

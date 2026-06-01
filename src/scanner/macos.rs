@@ -10,9 +10,10 @@
 /// 2. WeChat 需要进行 ad-hoc 签名
 /// 3. 在内存中搜索 x'<64hex><32hex>' 格式的 SQLCipher 密钥
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{collect_db_salts, KeyEntry};
+use super::{collect_db_salts, KeyEntry, ScanOptions};
+use crate::config;
 
 // Mach 相关常量
 const KERN_SUCCESS: i32 = 0;
@@ -77,18 +78,146 @@ extern "C" {
     ) -> kern_return_t;
 }
 
-/// 查找 WeChat 进程的 PID
-fn find_wechat_pid() -> Option<libc::pid_t> {
-    // 使用 pgrep -x WeChat 查找（与 C 版本一致）
+#[derive(Debug, Clone)]
+struct ProcessCandidate {
+    pid: libc::pid_t,
+    command: String,
+    app_path: Option<PathBuf>,
+    bundle_id: Option<String>,
+}
+
+/// 查找 WeChat 进程的 PID。
+///
+/// 双开时两个主进程都叫 `WeChat`，不能只用 `pgrep -x WeChat` 的第一行。
+/// 这里用进程实际路径反推出 `.app` bundle，再按 `--app` 或 `--bundle-id`
+/// 精确选择目标实例。
+fn find_wechat_process(opts: &ScanOptions) -> Result<ProcessCandidate> {
+    let process_name = opts
+        .process_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("WeChat");
     let output = std::process::Command::new("pgrep")
-        .args(["-x", "WeChat"])
+        .args(["-x", process_name])
+        .output()
+        .with_context(|| format!("执行 pgrep -x {} 失败", process_name))?;
+    if !output.status.success() {
+        bail!("找不到 {} 进程，请确认微信正在运行", process_name);
+    }
+    let mut candidates = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(pid) = line.trim().parse::<libc::pid_t>() else {
+            continue;
+        };
+        candidates.push(process_candidate(pid));
+    }
+
+    let mut matches: Vec<ProcessCandidate> = candidates
+        .iter()
+        .filter(|candidate| matches_filters(candidate, opts))
+        .cloned()
+        .collect();
+
+    if matches.len() == 1 {
+        return Ok(matches.remove(0));
+    }
+
+    let listing = describe_candidates(&candidates);
+    if matches.is_empty() {
+        bail!(
+            "找不到匹配目标的 WeChat 进程。\n\
+             当前候选进程：\n{}\n\
+             请确认传入的 --app / --bundle-id 与正在运行的微信实例一致。",
+            listing
+        );
+    }
+
+    bail!(
+        "发现多个匹配的 WeChat 进程，无法安全选择。\n\
+         当前候选进程：\n{}\n\
+         双开场景请使用 `wx init --app /Applications/WeChat2.app` 或 \
+         `wx init --bundle-id com.tencent.xinWeChat2` 明确目标。",
+        listing
+    )
+}
+
+fn process_candidate(pid: libc::pid_t) -> ProcessCandidate {
+    let command = process_command(pid).unwrap_or_default();
+    let app_path = app_path_from_command(&command);
+    let bundle_id = app_path
+        .as_deref()
+        .and_then(config::macos_bundle_id_from_app);
+    ProcessCandidate {
+        pid,
+        command,
+        app_path,
+        bundle_id,
+    }
+}
+
+fn process_command(pid: libc::pid_t) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&output.stdout);
-    s.trim().parse().ok()
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn app_path_from_command(command: &str) -> Option<PathBuf> {
+    let marker = ".app/";
+    let idx = command.find(marker)?;
+    Some(PathBuf::from(&command[..idx + ".app".len()]))
+}
+
+fn matches_filters(candidate: &ProcessCandidate, opts: &ScanOptions) -> bool {
+    if let Some(app_path) = opts.app_path.as_deref() {
+        let Some(candidate_app) = candidate.app_path.as_deref() else {
+            return false;
+        };
+        if !same_path(candidate_app, app_path) {
+            return false;
+        }
+    }
+
+    if let Some(bundle_id) = opts.bundle_id.as_deref() {
+        if candidate.bundle_id.as_deref() != Some(bundle_id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(l), Ok(r)) => l == r,
+        _ => left == right,
+    }
+}
+
+fn describe_candidates(candidates: &[ProcessCandidate]) -> String {
+    if candidates.is_empty() {
+        return "  (none)".to_string();
+    }
+    candidates
+        .iter()
+        .map(|c| {
+            format!(
+                "  pid={} app={} bundle_id={} cmd={}",
+                c.pid,
+                c.app_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string()),
+                c.bundle_id.as_deref().unwrap_or("(unknown)"),
+                c.command
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 判断字节是否是 ASCII 十六进制字符
@@ -97,10 +226,10 @@ fn is_hex_char(c: u8) -> bool {
     c.is_ascii_hexdigit()
 }
 
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
+pub fn scan_keys(db_dir: &Path, opts: &ScanOptions) -> Result<Vec<KeyEntry>> {
     // 1. 查找 WeChat PID
-    let pid = find_wechat_pid()
-        .context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
+    let process = find_wechat_process(opts)?;
+    let pid = process.pid;
     eprintln!("WeChat PID: {}", pid);
 
     // 2. 获取 task port
@@ -109,22 +238,32 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         let mut task: mach_port_t = 0;
         let kr = task_for_pid(mach_task_self(), pid, &mut task);
         if kr != KERN_SUCCESS {
+            let app = opts
+                .app_path
+                .as_ref()
+                .or(process.app_path.as_ref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "/Applications/WeChat.app".to_string());
             bail!(
                 "task_for_pid 失败 (kr={})。请按以下步骤修复：\n\
                 \n\
-                  1. 对 WeChat 重新签名（只需做一次）：\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app\n\
+                  1. 对目标 WeChat 重新签名（只需做一次）：\n\
+                     codesign --force --deep --sign - {}\n\
                 \n\
-                  2. 重启 WeChat：\n\
-                     killall WeChat && open /Applications/WeChat.app\n\
+                  2. 退出并重新打开目标 WeChat：\n\
+                     open {}\n\
                 \n\
                   3. 再次运行（需要 root）：\n\
                      sudo wx init\n\
                 \n\
                 如果 codesign 报 \"signature in use\"，先执行：\n\
-                     codesign --remove-signature /Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n\
-                     codesign --force --deep --sign - /Applications/WeChat.app",
-                kr
+                     codesign --remove-signature {}/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n\
+                     codesign --force --deep --sign - {}",
+                kr,
+                app,
+                app,
+                app,
+                app
             );
         }
         task
@@ -171,8 +310,14 @@ fn scan_memory(task: mach_port_t) -> Result<Vec<(String, String)>> {
     loop {
         let mut size: mach_vm_size_t = 0;
         let mut info = VmRegionBasicInfo64 {
-            protection: 0, max_protection: 0, inheritance: 0,
-            shared: 0, reserved: 0, _offset: 0, behavior: 0, user_wired_count: 0,
+            protection: 0,
+            max_protection: 0,
+            inheritance: 0,
+            shared: 0,
+            reserved: 0,
+            _offset: 0,
+            behavior: 0,
+            user_wired_count: 0,
         };
         let mut info_count: mach_msg_type_number_t = info_count_expected;
         let mut obj_name: mach_port_t = 0;
@@ -228,15 +373,11 @@ fn scan_region(
         // SAFETY: mach_vm_read 读取目标进程内存到内核缓冲区，
         // 返回的 data 指针指向通过 vm_allocate 分配的内存，
         // 必须用 mach_vm_deallocate 释放
-        let kr = unsafe {
-            mach_vm_read(task, ca, cs, &mut data, &mut dc)
-        };
+        let kr = unsafe { mach_vm_read(task, ca, cs, &mut data, &mut dc) };
 
         if kr == KERN_SUCCESS {
             // SAFETY: data 是 mach_vm_read 返回的有效指针，dc 是字节数
-            let buf: &[u8] = unsafe {
-                std::slice::from_raw_parts(data as *const u8, dc as usize)
-            };
+            let buf: &[u8] = unsafe { std::slice::from_raw_parts(data as *const u8, dc as usize) };
 
             search_pattern(buf, results);
 
@@ -290,10 +431,8 @@ pub(crate) fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
         }
 
         // 提取 key_hex 和 salt_hex，统一转小写
-        let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64])
-            .to_lowercase();
-        let salt_hex = String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96])
-            .to_lowercase();
+        let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64]).to_lowercase();
+        let salt_hex = String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96]).to_lowercase();
 
         // 去重检查
         let is_dup = results.iter().any(|(k, s)| k == &key_hex && s == &salt_hex);
@@ -308,6 +447,7 @@ pub(crate) fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// 构造一条合法的 x'<key><salt>' 模式字节串
     fn make_pattern(key: &[u8; 64], salt: &[u8; 32]) -> Vec<u8> {
@@ -320,9 +460,15 @@ mod tests {
 
     #[test]
     fn test_is_hex_char_valid() {
-        for c in b'0'..=b'9' { assert!(is_hex_char(c), "digit {}", c as char); }
-        for c in b'a'..=b'f' { assert!(is_hex_char(c), "lower {}", c as char); }
-        for c in b'A'..=b'F' { assert!(is_hex_char(c), "upper {}", c as char); }
+        for c in b'0'..=b'9' {
+            assert!(is_hex_char(c), "digit {}", c as char);
+        }
+        for c in b'a'..=b'f' {
+            assert!(is_hex_char(c), "lower {}", c as char);
+        }
+        for c in b'A'..=b'F' {
+            assert!(is_hex_char(c), "upper {}", c as char);
+        }
     }
 
     #[test]
@@ -334,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_search_pattern_basic() {
-        let key  = [b'a'; 64];
+        let key = [b'a'; 64];
         let salt = [b'b'; 32];
         let buf = make_pattern(&key, &salt);
         let mut results = Vec::new();
@@ -347,7 +493,7 @@ mod tests {
     #[test]
     fn test_search_pattern_uppercase_lowercased() {
         // 大写十六进制字符应被统一转为小写
-        let key  = [b'A'; 64];
+        let key = [b'A'; 64];
         let salt = [b'B'; 32];
         let buf = make_pattern(&key, &salt);
         let mut results = Vec::new();
@@ -383,7 +529,7 @@ mod tests {
     #[test]
     fn test_search_pattern_dedup() {
         // 相同模式出现两次 → 只保留一条
-        let key  = [b'1'; 64];
+        let key = [b'1'; 64];
         let salt = [b'2'; 32];
         let pattern = make_pattern(&key, &salt);
         let mut buf = pattern.clone();
@@ -396,8 +542,10 @@ mod tests {
     #[test]
     fn test_search_pattern_multiple_distinct() {
         // 两个不同的合法模式 → 各自独立捕获
-        let key1  = [b'a'; 64]; let salt1 = [b'b'; 32];
-        let key2  = [b'c'; 64]; let salt2 = [b'd'; 32];
+        let key1 = [b'a'; 64];
+        let salt1 = [b'b'; 32];
+        let key2 = [b'c'; 64];
+        let salt2 = [b'd'; 32];
         let mut buf = make_pattern(&key1, &salt1);
         buf.extend_from_slice(&make_pattern(&key2, &salt2));
         let mut results = Vec::new();
@@ -412,7 +560,7 @@ mod tests {
     fn test_search_pattern_embedded_in_garbage() {
         // 模式夹在垃圾字节中间，仍应找到
         let mut buf = vec![0xFFu8; 50];
-        let key  = [b'e'; 64];
+        let key = [b'e'; 64];
         let salt = [b'f'; 32];
         buf.extend_from_slice(&make_pattern(&key, &salt));
         buf.extend_from_slice(&[0x00u8; 50]);
@@ -438,11 +586,35 @@ mod tests {
     }
 
     #[test]
+    fn app_path_from_command_extracts_outer_bundle() {
+        let command = "/Applications/WeChat2.app/Contents/MacOS/WeChat";
+        assert_eq!(
+            app_path_from_command(command).as_deref(),
+            Some(Path::new("/Applications/WeChat2.app"))
+        );
+    }
+
+    #[test]
+    fn app_path_from_command_extracts_nested_helper_outer_bundle() {
+        let command =
+            "/Applications/WeChat2.app/Contents/MacOS/WeChatAppEx.app/Contents/MacOS/WeChatAppEx";
+        assert_eq!(
+            app_path_from_command(command).as_deref(),
+            Some(Path::new("/Applications/WeChat2.app"))
+        );
+    }
+
+    #[test]
     fn test_search_pattern_real_hex_mix() {
         // 合法的混合大小写十六进制（0-9, a-f, A-F）
         let mut key = [b'0'; 64];
-        for (i, c) in b"0123456789abcdefABCDEF0123456789abcdef0123456789abcdef01234567".iter().enumerate() {
-            if i < 64 { key[i] = *c; }
+        for (i, c) in b"0123456789abcdefABCDEF0123456789abcdef0123456789abcdef01234567"
+            .iter()
+            .enumerate()
+        {
+            if i < 64 {
+                key[i] = *c;
+            }
         }
         let salt = [b'9'; 32];
         let buf = make_pattern(&key, &salt);
@@ -450,6 +622,9 @@ mod tests {
         search_pattern(&buf, &mut results);
         assert_eq!(results.len(), 1);
         // 结果应全小写
-        assert!(results[0].0.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(results[0]
+            .0
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 }

@@ -7,13 +7,17 @@ use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use super::{collect_db_salts, KeyEntry};
+use super::{collect_db_salts, KeyEntry, ScanOptions};
 
 const HEX_PATTERN_LEN: usize = 96;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /// 查找 WeChat 进程 PID
-fn find_wechat_pid() -> Option<u32> {
+fn find_wechat_pid(process_name: Option<&str>) -> Option<u32> {
+    let target = process_name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("wechat")
+        .to_lowercase();
     let proc_dir = std::fs::read_dir("/proc").ok()?;
     for entry in proc_dir.flatten() {
         let name = entry.file_name();
@@ -25,7 +29,8 @@ fn find_wechat_pid() -> Option<u32> {
         let comm_path = format!("/proc/{}/comm", name_str);
         if let Ok(comm) = std::fs::read_to_string(&comm_path) {
             let comm = comm.trim().to_lowercase();
-            if comm == "wechat" || comm == "weixin" {
+            if comm == target || (process_name.is_none() && (comm == "wechat" || comm == "weixin"))
+            {
                 if let Ok(pid) = name_str.parse::<u32>() {
                     return Some(pid);
                 }
@@ -38,8 +43,8 @@ fn find_wechat_pid() -> Option<u32> {
 /// 解析 /proc/<pid>/maps 文件，返回可读的内存区域 (start, end)
 fn parse_maps(pid: u32) -> Result<Vec<(u64, u64)>> {
     let maps_path = format!("/proc/{}/maps", pid);
-    let content = std::fs::read_to_string(&maps_path)
-        .with_context(|| format!("读取 {} 失败", maps_path))?;
+    let content =
+        std::fs::read_to_string(&maps_path).with_context(|| format!("读取 {} 失败", maps_path))?;
 
     let mut regions = Vec::new();
     for line in content.lines() {
@@ -67,8 +72,8 @@ fn parse_maps(pid: u32) -> Result<Vec<(u64, u64)>> {
     Ok(regions)
 }
 
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    let pid = find_wechat_pid()
+pub fn scan_keys(db_dir: &Path, opts: &ScanOptions) -> Result<Vec<KeyEntry>> {
+    let pid = find_wechat_pid(opts.process_name.as_deref())
         .context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
     eprintln!("WeChat PID: {}", pid);
 
@@ -107,12 +112,7 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     Ok(entries)
 }
 
-fn scan_region(
-    mem: &mut std::fs::File,
-    start: u64,
-    end: u64,
-    results: &mut Vec<(String, String)>,
-) {
+fn scan_region(mem: &mut std::fs::File, start: u64, end: u64, results: &mut Vec<(String, String)>) {
     let total_len = (end - start) as usize;
     let overlap = HEX_PATTERN_LEN + 3;
     let mut offset = 0usize;
@@ -172,10 +172,8 @@ fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
             i += 1;
             continue;
         }
-        let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64])
-            .to_lowercase();
-        let salt_hex = String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96])
-            .to_lowercase();
+        let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64]).to_lowercase();
+        let salt_hex = String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96]).to_lowercase();
         let is_dup = results.iter().any(|(k, s)| k == &key_hex && s == &salt_hex);
         if !is_dup {
             results.push((key_hex, salt_hex));

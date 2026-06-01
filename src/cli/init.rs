@@ -1,52 +1,128 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::config;
-use crate::scanner;
+use crate::scanner::{self, ScanOptions};
 
-pub fn cmd_init(force: bool) -> Result<()> {
+pub fn cmd_init(
+    force: bool,
+    db_dir_arg: Option<PathBuf>,
+    app_arg: Option<PathBuf>,
+    bundle_id_arg: Option<String>,
+    wechat_process_arg: Option<String>,
+) -> Result<()> {
     // 查找 config.json
     let config_path = find_or_create_config_path();
+    let existing_cfg = read_config_map(&config_path);
 
     // 检查是否已初始化
-    if !force && config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-                let db_dir = cfg.get("db_dir").and_then(|v| v.as_str()).unwrap_or("");
-                let keys_file = cfg.get("keys_file").and_then(|v| v.as_str()).unwrap_or("all_keys.json");
-                let keys_path = if std::path::Path::new(keys_file).is_absolute() {
-                    std::path::PathBuf::from(keys_file)
-                } else {
-                    config_path.parent().unwrap_or(std::path::Path::new("."))
-                        .join(keys_file)
-                };
-                if !db_dir.is_empty() && !db_dir.contains("your_wxid")
-                    && std::path::Path::new(db_dir).exists()
-                    && keys_path.exists()
-                {
-                    println!("已初始化，数据目录: {}", db_dir);
-                    println!("如需重新扫描密钥，使用 --force");
-                    return Ok(());
-                }
+    let selector_supplied = db_dir_arg.is_some()
+        || app_arg.is_some()
+        || bundle_id_arg.is_some()
+        || wechat_process_arg.is_some();
+    let target_selector_supplied =
+        db_dir_arg.is_some() || app_arg.is_some() || bundle_id_arg.is_some();
+    if !force && !selector_supplied {
+        if let Some(cfg) = existing_cfg.as_ref() {
+            let db_dir = cfg.get("db_dir").and_then(|v| v.as_str()).unwrap_or("");
+            let keys_file = cfg
+                .get("keys_file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("all_keys.json");
+            let keys_path = if std::path::Path::new(keys_file).is_absolute() {
+                std::path::PathBuf::from(keys_file)
+            } else {
+                config_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(keys_file)
+            };
+            if !db_dir.is_empty()
+                && !db_dir.contains("your_wxid")
+                && std::path::Path::new(db_dir).exists()
+                && keys_path.exists()
+            {
+                println!("已初始化，数据目录: {}", db_dir);
+                println!("如需重新扫描密钥，使用 --force");
+                return Ok(());
             }
         }
     }
 
+    let existing_db_dir = if target_selector_supplied {
+        None
+    } else {
+        existing_string(&existing_cfg, "db_dir").map(PathBuf::from)
+    };
+    let app_path = match app_arg {
+        Some(path) => Some(normalize_path(path)),
+        None if !target_selector_supplied => existing_string(&existing_cfg, "app_path")
+            .map(PathBuf::from)
+            .map(normalize_path),
+        None => None,
+    };
+    let bundle_id_arg = match bundle_id_arg {
+        Some(id) if !id.trim().is_empty() => Some(id),
+        Some(_) => None,
+        None if !target_selector_supplied => existing_string(&existing_cfg, "bundle_id"),
+        None => None,
+    };
+    let db_dir_for_bundle = db_dir_arg.as_deref().or(existing_db_dir.as_deref());
+    let bundle_id = resolve_bundle_id(bundle_id_arg, app_path.as_deref(), db_dir_for_bundle);
+    if db_dir_arg.is_none()
+        && existing_db_dir.is_none()
+        && app_path.is_some()
+        && bundle_id.is_none()
+    {
+        anyhow::bail!("无法从 --app 读取 bundle id；请同时传 --bundle-id 或 --db-dir");
+    }
+    let wechat_process = wechat_process_arg
+        .or_else(|| existing_string(&existing_cfg, "wechat_process"))
+        .unwrap_or_else(default_process_name);
+
     // Step 1: 检测 db_dir
-    println!("检测微信数据目录...");
-    let db_dir = config::auto_detect_db_dir().with_context(|| format!(
-        "未能自动检测到微信数据目录\n\
-         请编辑配置文件并填写 db_dir 字段:\n  \
-         {}\n\
-         （文件不存在则首次保存后自动创建；db_dir 示例: <data_root>\\xwechat_files\\<wxid>\\db_storage）",
-        config_path.display()
-    ))?;
+    let db_dir = if let Some(db_dir) = db_dir_arg {
+        let db_dir = normalize_path(db_dir);
+        if !db_dir.is_dir() {
+            anyhow::bail!("指定的 db_storage 目录不存在: {}", db_dir.display());
+        }
+        db_dir
+    } else if let Some(db_dir) = existing_db_dir.filter(|p| p.is_dir()) {
+        normalize_path(db_dir)
+    } else {
+        println!("检测微信数据目录...");
+        config::auto_detect_db_dir_for_bundle(bundle_id.as_deref()).with_context(|| {
+            let bundle_hint = bundle_id
+                .as_deref()
+                .map(|id| format!("（bundle_id: {id}）"))
+                .unwrap_or_default();
+            format!(
+                "未能自动检测到微信数据目录{bundle_hint}\n\
+                 请编辑配置文件并填写 db_dir 字段:\n  \
+                 {}\n\
+                 或运行: wx init --db-dir <data_root>/xwechat_files/<wxid>/db_storage",
+                config_path.display()
+            )
+        })?
+    };
     println!("找到数据目录: {}", db_dir.display());
+    if let Some(bundle_id) = bundle_id.as_deref() {
+        println!("目标 bundle id: {}", bundle_id);
+    }
+    if let Some(app_path) = app_path.as_deref() {
+        println!("目标 App: {}", app_path.display());
+    }
 
     // Step 2: 扫描密钥（需要 root/sudo）
     println!("扫描加密密钥（需要 root 权限）...");
-    let entries = scanner::scan_keys(&db_dir)?;
+    let scan_opts = ScanOptions {
+        process_name: Some(wechat_process.clone()),
+        bundle_id: bundle_id.clone(),
+        app_path: app_path.clone(),
+    };
+    let entries = scanner::scan_keys(&db_dir, &scan_opts)?;
 
     // === 权限边界 ===
     // 扫描完成后立即 drop 到调用用户身份，后续文件写入都是用户属主。
@@ -62,15 +138,19 @@ pub fn cmd_init(force: bool) -> Result<()> {
     }
 
     // Step 3: 保存 all_keys.json
-    let keys_file_path = config_path.parent()
+    let keys_file_path = config_path
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("all_keys.json");
 
     let mut keys_json = serde_json::Map::new();
     for entry in &entries {
-        keys_json.insert(entry.db_name.clone(), json!({
-            "enc_key": entry.enc_key,
-        }));
+        keys_json.insert(
+            entry.db_name.clone(),
+            json!({
+                "enc_key": entry.enc_key,
+            }),
+        );
     }
     std::fs::write(&keys_file_path, serde_json::to_string_pretty(&keys_json)?)
         .context("写入 all_keys.json 失败")?;
@@ -90,8 +170,17 @@ pub fn cmd_init(force: bool) -> Result<()> {
         }
     }
     cfg.insert("db_dir".into(), json!(db_dir.to_string_lossy()));
-    cfg.entry("keys_file".into()).or_insert_with(|| json!("all_keys.json"));
-    cfg.entry("decrypted_dir".into()).or_insert_with(|| json!("decrypted"));
+    cfg.entry("keys_file".into())
+        .or_insert_with(|| json!("all_keys.json"));
+    cfg.entry("decrypted_dir".into())
+        .or_insert_with(|| json!("decrypted"));
+    cfg.insert("wechat_process".into(), json!(wechat_process));
+    if let Some(bundle_id) = bundle_id {
+        cfg.insert("bundle_id".into(), json!(bundle_id));
+    }
+    if let Some(app_path) = app_path {
+        cfg.insert("app_path".into(), json!(app_path.to_string_lossy()));
+    }
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg)?)
         .context("写入 config.json 失败")?;
@@ -116,6 +205,73 @@ pub fn cmd_init(force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_config_map(
+    config_path: &std::path::Path,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+fn existing_string(
+    cfg: &Option<serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    cfg.as_ref()?
+        .get(key)?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn default_process_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "WeChat".to_string()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "wechat".to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Weixin.exe".to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "WeChat".to_string()
+    }
+}
+
+fn resolve_bundle_id(
+    explicit: Option<String>,
+    app_path: Option<&std::path::Path>,
+    db_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    if matches!(explicit.as_deref(), Some(s) if !s.trim().is_empty()) {
+        return explicit;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app_path
+            .and_then(config::macos_bundle_id_from_app)
+            .or_else(|| db_dir.and_then(config::macos_bundle_id_from_db_dir))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_path;
+        let _ = db_dir;
+        None
+    }
 }
 
 /// 如果当前以 root 身份运行且是通过 sudo 启动的，drop 到调用用户身份，
@@ -144,14 +300,16 @@ fn drop_privileges_if_sudo() -> Result<()> {
     // 迁移旧版本遗留：如果 ~/.wx-cli/ 已存在且属 root，把它 chown 回调用用户，
     // 顺便把 raw key 文件的权限也收紧到 0600（旧版默认 0644，世界可读等于泄露）。
     // 这些必须在 setuid 之前做：chown 需要 root，chmod 也只有属主或 root 能改。
-    let cli_dir = config::cli_dir();
-    if cli_dir.exists() {
-        let _ = chown_recursive(&cli_dir, uid, gid);
-        let _ = tighten_perms(&cli_dir);
+    let cli_base_dir = config::cli_base_dir();
+    if cli_base_dir.exists() {
+        let _ = chown_recursive(&cli_base_dir, uid, gid);
+        let _ = tighten_perms(&cli_base_dir);
     }
 
     // 设置 umask，让后续 create 出来的文件/目录默认是 0600 / 0700。
-    unsafe { libc::umask(0o077); }
+    unsafe {
+        libc::umask(0o077);
+    }
 
     // 必须先 setgid 再 setuid：一旦 uid 降下来就没法再改 gid 了。
     unsafe {
@@ -175,8 +333,9 @@ fn drop_privileges_if_sudo() -> Result<()> {
         Ok(())
     }
     fn chown_one(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-        let c = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
         if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -201,6 +360,9 @@ fn drop_privileges_if_sudo() -> Result<()> {
 }
 
 fn find_or_create_config_path() -> std::path::PathBuf {
+    if config::profile_is_active() {
+        return config::cli_dir().join("config.json");
+    }
     // 如果当前工作目录或可执行文件目录已有 config.json，沿用它（支持便携模式）
     if let Ok(cwd) = std::env::current_dir() {
         let p = cwd.join("config.json");

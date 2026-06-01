@@ -22,11 +22,15 @@ pub mod unread;
 use self::output::OutputOpts;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// wx — 微信本地数据 CLI
 #[derive(Parser)]
 #[command(name = "wx", version = env!("CARGO_PKG_VERSION"), about = "wx — 微信本地数据 CLI")]
 pub struct Cli {
+    /// 使用独立 profile（配置、keys、daemon 和缓存均隔离）
+    #[arg(long, global = true)]
+    profile: Option<String>,
     /// 返回更重的 freshness/source 元数据（如 per-shard latest、cache modes）
     #[arg(long, global = true)]
     with_meta: bool,
@@ -44,6 +48,18 @@ enum Commands {
         /// 强制重新扫描（覆盖已有配置）
         #[arg(long)]
         force: bool,
+        /// 显式指定微信 db_storage 目录
+        #[arg(long, value_name = "PATH")]
+        db_dir: Option<PathBuf>,
+        /// macOS: 指定微信 app bundle 路径，例如 /Applications/WeChat2.app
+        #[arg(long, value_name = "APP")]
+        app: Option<PathBuf>,
+        /// macOS: 指定 bundle id，例如 com.tencent.xinWeChat2
+        #[arg(long, value_name = "ID")]
+        bundle_id: Option<String>,
+        /// 指定进程名（默认 macOS: WeChat, Windows: Weixin.exe, Linux: wechat）
+        #[arg(long, value_name = "NAME")]
+        wechat_process: Option<String>,
     },
     /// 列出最近会话
     Sessions {
@@ -342,10 +358,17 @@ pub fn run() {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    crate::config::activate_profile(cli.profile.as_deref())?;
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {
-        Commands::Init { force } => init::cmd_init(force),
+        Commands::Init {
+            force,
+            db_dir,
+            app,
+            bundle_id,
+            wechat_process,
+        } => init::cmd_init(force, db_dir, app, bundle_id, wechat_process),
         Commands::Sessions { limit, json } => sessions::cmd_sessions(
             limit,
             OutputOpts {

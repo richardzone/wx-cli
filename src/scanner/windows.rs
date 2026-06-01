@@ -19,13 +19,16 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
-use super::{collect_db_salts, KeyEntry};
+use super::{collect_db_salts, KeyEntry, ScanOptions};
 
 const HEX_PATTERN_LEN: usize = 96;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /// 查找 Weixin.exe 进程 PID
-fn find_wechat_pid() -> Option<u32> {
+fn find_wechat_pid(process_name: Option<&str>) -> Option<u32> {
+    let target = process_name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Weixin.exe");
     // SAFETY: CreateToolhelp32Snapshot 标准 Windows API
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
 
@@ -43,7 +46,7 @@ fn find_wechat_pid() -> Option<u32> {
         loop {
             let name =
                 std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
-            if name.eq_ignore_ascii_case("Weixin.exe") {
+            if name.eq_ignore_ascii_case(target) {
                 let pid = entry.th32ProcessID;
                 let _ = CloseHandle(snap);
                 return Some(pid);
@@ -57,8 +60,9 @@ fn find_wechat_pid() -> Option<u32> {
     None
 }
 
-pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    let pid = find_wechat_pid().context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
+pub fn scan_keys(db_dir: &Path, opts: &ScanOptions) -> Result<Vec<KeyEntry>> {
+    let pid = find_wechat_pid(opts.process_name.as_deref())
+        .context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
     eprintln!("WeChat PID: {}", pid);
 
     // SAFETY: OpenProcess 请求读取权限

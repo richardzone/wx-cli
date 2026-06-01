@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+const PROFILE_ENV: &str = "WX_PROFILE";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db_dir: PathBuf,
@@ -9,6 +11,10 @@ pub struct Config {
     pub decrypted_dir: PathBuf,
     #[serde(default)]
     pub wechat_process: String,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub app_path: Option<PathBuf>,
 }
 
 /// 从当前工作目录 / <exe_dir> / $HOME/.wx-cli 加载配置
@@ -58,16 +64,34 @@ pub fn load_config() -> Result<Config> {
         .and_then(|v| v.as_str())
         .unwrap_or(default_wechat_process())
         .to_string();
+    let bundle_id = raw
+        .get("bundle_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_path = raw.get("app_path").and_then(|v| v.as_str()).map(|s| {
+        let p = PathBuf::from(s);
+        if p.is_absolute() {
+            p
+        } else {
+            base_dir.join(p)
+        }
+    });
 
     Ok(Config {
         db_dir,
         keys_file,
         decrypted_dir,
         wechat_process,
+        bundle_id,
+        app_path,
     })
 }
 
 fn find_config_file() -> Result<PathBuf> {
+    if active_profile().is_some() {
+        return Ok(cli_dir().join("config.json"));
+    }
+
     let cwd_dir = std::env::current_dir().ok();
     let exe_dir = std::env::current_exe()
         .ok()
@@ -120,7 +144,59 @@ fn home_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".wx-cli").join("config.json")
 }
 
+pub fn activate_profile(profile: Option<&str>) -> Result<()> {
+    match profile {
+        Some(profile) => {
+            validate_profile_name(profile)?;
+            std::env::set_var(PROFILE_ENV, profile);
+        }
+        None => {
+            std::env::remove_var(PROFILE_ENV);
+        }
+    }
+    Ok(())
+}
+
+pub fn active_profile() -> Option<String> {
+    std::env::var(PROFILE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn profile_is_active() -> bool {
+    active_profile().is_some()
+}
+
+pub fn validate_profile_name(profile: &str) -> Result<()> {
+    if is_valid_profile_name(profile) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "profile 只能包含 ASCII 字母、数字、点、下划线和短横线，且不能是 '.' 或 '..': {}",
+            profile
+        )
+    }
+}
+
+fn is_valid_profile_name(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile != "."
+        && profile != ".."
+        && profile
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
 pub fn cli_dir() -> PathBuf {
+    let base = cli_base_dir();
+    match active_profile() {
+        Some(profile) => base.join("profiles").join(profile),
+        None => base,
+    }
+}
+
+pub fn cli_base_dir() -> PathBuf {
     cli_home_dir().join(".wx-cli")
 }
 
@@ -224,15 +300,29 @@ fn default_wechat_process() -> &'static str {
 }
 
 /// 自动检测微信 db_storage 目录
+#[allow(dead_code)]
 pub fn auto_detect_db_dir() -> Option<PathBuf> {
-    detect_db_dir_impl()
+    detect_db_dir_impl(None)
+}
+
+/// 自动检测指定 macOS bundle id 对应的微信 db_storage 目录。
+///
+/// 其他平台忽略 bundle_id，保持原有自动检测逻辑。
+pub fn auto_detect_db_dir_for_bundle(bundle_id: Option<&str>) -> Option<PathBuf> {
+    detect_db_dir_impl(bundle_id)
 }
 
 #[cfg(target_os = "macos")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
+fn detect_db_dir_impl(bundle_id: Option<&str>) -> Option<PathBuf> {
     let home = sudo_user_home_dir().or_else(dirs::home_dir)?;
+    let bundle_id = bundle_id
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("com.tencent.xinWeChat");
 
-    let base = home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files");
+    let base = home
+        .join("Library/Containers")
+        .join(bundle_id)
+        .join("Data/Documents/xwechat_files");
     if !base.exists() {
         return None;
     }
@@ -253,8 +343,37 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
     candidates.into_iter().next_back()
 }
 
+#[cfg(target_os = "macos")]
+pub fn macos_bundle_id_from_app(app_path: &Path) -> Option<String> {
+    let info = app_path.join("Contents/Info.plist");
+    let output = std::process::Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleIdentifier"])
+        .arg(&info)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bundle_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!bundle_id.is_empty()).then_some(bundle_id)
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_bundle_id_from_db_dir(db_dir: &Path) -> Option<String> {
+    let parts: Vec<String> = db_dir
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts
+        .windows(5)
+        .find(|w| {
+            w[0] == "Containers" && w[2] == "Data" && w[3] == "Documents" && w[4] == "xwechat_files"
+        })
+        .map(|w| w[1].clone())
+}
+
 #[cfg(target_os = "linux")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
+fn detect_db_dir_impl(_bundle_id: Option<&str>) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let sudo_home = sudo_user_home_dir();
 
@@ -308,7 +427,7 @@ fn latest_db_mtime(dir: &Path) -> Option<std::time::SystemTime> {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_db_dir_impl() -> Option<PathBuf> {
+fn detect_db_dir_impl(_bundle_id: Option<&str>) -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let config_dir = PathBuf::from(&appdata).join("Tencent/xwechat/config");
     if !config_dir.exists() {
@@ -361,9 +480,7 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
 fn resolve_windows_data_root(content: &str) -> Option<PathBuf> {
     let trimmed = content.trim();
     // Strip an optional trailing slash so `MyDocument:\` and `MyDocument:/` also match.
-    let stripped = trimmed
-        .strip_suffix(['\\', '/'])
-        .unwrap_or(trimmed);
+    let stripped = trimmed.strip_suffix(['\\', '/']).unwrap_or(trimmed);
     if stripped.eq_ignore_ascii_case("MyDocument:") {
         return known_documents_dir();
     }
@@ -376,9 +493,7 @@ fn known_documents_dir() -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{
-        FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
-    };
+    use windows::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
     // SAFETY: standard Win32 known-folder API. SHGetKnownFolderPath either returns
     // a heap-allocated PWSTR that the caller must free with CoTaskMemFree, or an
@@ -409,7 +524,7 @@ fn known_documents_dir() -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn detect_db_dir_impl() -> Option<PathBuf> {
+fn detect_db_dir_impl(_bundle_id: Option<&str>) -> Option<PathBuf> {
     None
 }
 
@@ -480,6 +595,28 @@ mod tests {
         assert_eq!(path, cwd.join("config.json"));
     }
 
+    #[test]
+    fn profile_name_validation_allows_safe_names_only() {
+        for name in ["main", "work-2", "wx_2", "com.tencent.xinWeChat2"] {
+            assert!(super::is_valid_profile_name(name), "{name}");
+        }
+        for name in ["", ".", "..", "../x", "wx/2", "中文", "wx 2"] {
+            assert!(!super::is_valid_profile_name(name), "{name}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_id_from_db_dir_reads_container_component() {
+        let path = PathBuf::from(
+            "/Users/alice/Library/Containers/com.tencent.xinWeChat2/Data/Documents/xwechat_files/wxid_x/db_storage",
+        );
+        assert_eq!(
+            super::macos_bundle_id_from_db_dir(&path).as_deref(),
+            Some("com.tencent.xinWeChat2")
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn resolve_windows_data_root_passes_through_absolute_path() {
@@ -493,7 +630,12 @@ mod tests {
         // Should match the keyword exactly (case-insensitive, with or without trailing slash)
         // and resolve to a non-empty Documents path via SHGetKnownFolderPath.
         let docs = known_documents_dir().expect("Documents known folder must resolve");
-        for keyword in ["MyDocument:", "mydocument:", "MyDocument:\\", "MyDocument:/"] {
+        for keyword in [
+            "MyDocument:",
+            "mydocument:",
+            "MyDocument:\\",
+            "MyDocument:/",
+        ] {
             let resolved = resolve_windows_data_root(keyword)
                 .unwrap_or_else(|| panic!("keyword {keyword:?} should resolve"));
             assert_eq!(resolved, docs, "keyword {keyword:?}");
