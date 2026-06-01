@@ -257,7 +257,8 @@ fn ping_unix() -> Result<bool> {
 fn ping_windows() -> Result<bool> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
+    let pipe_name = config::local_socket_name();
+    let name = pipe_name.as_str().to_ns_name::<GenericNamespaced>()?;
     let stream = Stream::connect(name)?;
     let mut reader = BufReader::new(stream);
 
@@ -468,7 +469,9 @@ fn send_unix(req: Request) -> Result<Response> {
 fn send_windows(req: Request) -> Result<Response> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
-    let name = "wx-cli-daemon"
+    let pipe_name = config::local_socket_name();
+    let name = pipe_name
+        .as_str()
         .to_ns_name::<GenericNamespaced>()
         .context("构造 pipe name 失败")?;
     let stream = Stream::connect(name).context("连接 daemon named pipe 失败")?;

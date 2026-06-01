@@ -84,13 +84,13 @@ async fn serve_windows(
 ) -> Result<()> {
     use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions};
 
-    // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀，
-    // 这里必须传相对名；client 端用 `\\.\pipe\wx-cli-daemon` 直接打开可以对上
-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
+    // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀。
+    let pipe_name = crate::config::local_socket_name();
+    let name = pipe_name.as_str().to_ns_name::<GenericNamespaced>()?;
     let opts = ListenerOptions::new().name(name);
     let listener = opts.create_tokio()?;
 
-    eprintln!("[server] 监听 \\\\.\\pipe\\wx-cli-daemon");
+    eprintln!("[server] 监听 \\\\.\\pipe\\{}", pipe_name);
 
     loop {
         let conn = listener.accept().await?;

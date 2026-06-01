@@ -249,6 +249,14 @@ pub fn log_path() -> PathBuf {
     cli_dir().join("daemon.log")
 }
 
+#[allow(dead_code)]
+pub fn local_socket_name() -> String {
+    match active_profile() {
+        Some(profile) => format!("wx-cli-daemon-{}", profile),
+        None => "wx-cli-daemon".to_string(),
+    }
+}
+
 pub fn cache_dir() -> PathBuf {
     cli_dir().join("cache")
 }
