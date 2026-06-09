@@ -280,11 +280,14 @@ wx attachments "AI群" --since 2026-04-01 --until 2026-04-15
 # 2) 用 attachment_id 把单个资源解密写到指定路径
 wx extract <attachment_id> -o ~/Desktop/photo.jpg
 wx extract <attachment_id> -o /tmp/x.jpg --overwrite
+wx extract <attachment_id> -o /tmp/raw.wxgf --raw     # 保留原始 WXGF/HEVC 容器
 ```
 
 `attachments` 输出每条带：`attachment_id` / `kind`（当前固定 `image`）/ `type` / `local_id` / `timestamp` / `time`，群聊里另带 `sender` 和稳定身份三件套（同上文）。命令名保留成 `attachments` 是为了后续扩到其他附件类型时不 break CLI。
 
-`extract` 报告里带：`md5` / `dat_path` / `dat_size` / `output` / `output_size` / `format`（实际识别出的图片格式：jpg / png / gif / webp / hevc 等）/ `decoder`（实际选用的解码器：`legacy_xor` / `v1_aes` / `v2`）。
+`extract` 报告里带：`md5` / `dat_path` / `dat_size` / `output` / `output_size` / `format`（实际写出的图片格式：jpg / png / gif / webp 等）/ `decoder`（实际选用的解码器：`legacy_xor` / `v1_aes` / `v2`）。
+
+微信 4 图片可能解码成 `WXGF/WXAM` 容器（头部 `wxgf`，内部是 HEVC）。默认 `wx extract` 会自动提取 WXGF 里的最大 HEVC partition 并用 `ffmpeg` 转 JPG；报告会带 `source_format: hevc`、`source_size`、`transcoder` 和 `wxgf_partition_*`。如果只需要原始容器，传 `--raw`。如果本地只拿到 `_t.dat` 缩略图，输出会很小且文字图片不可读；让用户先在微信客户端点开图片，等完整 `.dat` 下载到本地后再重新 `wx extract`。
 
 支持的解码档位：
 - **legacy XOR**：早期单字节 XOR，无 magic（按文件首字节探测格式自动反推）

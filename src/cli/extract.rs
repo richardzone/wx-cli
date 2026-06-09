@@ -13,12 +13,14 @@ pub fn cmd_extract(
     attachment_id: String,
     output: String,
     overwrite: bool,
+    raw: bool,
     json: bool,
 ) -> Result<()> {
     let req = Request::Extract {
         attachment_id,
         output,
         overwrite,
+        raw,
     };
     let resp = transport::send(req)?;
     print_value(&resp.data, &resolve(json))
