@@ -17,9 +17,10 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::TimeZone;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::AttachmentId;
+use super::{AttachmentId, AttachmentKind};
 
 /// 单条 attachment 在资源库 + 本地 attach 树下的解析结果。
 #[derive(Debug, Clone)]
@@ -38,6 +39,14 @@ pub struct ResolvedAttachment {
 #[derive(Debug, Clone)]
 pub struct AttachmentMetadata {
     pub md5: String,
+}
+
+/// `message/media_0.db::VoiceInfo` 中的一条语音资源。
+#[derive(Debug, Clone)]
+pub struct ResolvedVoiceMedia {
+    pub data: Vec<u8>,
+    pub chunks: usize,
+    pub svr_id: Option<i64>,
 }
 
 /// 用 `(chat, local_id)` 查 message_resource.db 拿 file md5。
@@ -87,8 +96,8 @@ pub fn lookup_md5_blocking(
         )
         .ok();
 
-    let packed: Option<Vec<u8>> = packed_exact.or_else(|| conn
-        .query_row(
+    let packed: Option<Vec<u8>> = packed_exact.or_else(|| {
+        conn.query_row(
             "SELECT packed_info FROM MessageResourceInfo
              WHERE chat_id = ?1
                AND message_local_id = ?2
@@ -98,12 +107,177 @@ pub fn lookup_md5_blocking(
             rusqlite::params![chat_id, local_id, msg_local_type_lo32],
             |row| row.get(0),
         )
-        .ok());
+        .ok()
+    });
 
     let Some(blob) = packed else {
         return Ok(None);
     };
     Ok(extract_md5_from_packed_info(&blob).map(|md5| AttachmentMetadata { md5 }))
+}
+
+/// 从 `message/media_0.db` 的 VoiceInfo 表读取语音 BLOB。
+///
+/// WeChat 4.x 语音不一定进入 `message_resource.db`，常见路径是：
+/// `media_0.db::VoiceInfo(local_id, create_time, voice_data, data_index)`。
+/// `data_index` 预留分片能力，所以这里按 data_index 顺序拼接同一条语音的所有 chunk。
+pub fn lookup_voice_media_blocking(
+    media_db_path: &Path,
+    chat: &str,
+    local_id: i64,
+    create_time: i64,
+) -> Result<Option<ResolvedVoiceMedia>> {
+    let conn = Connection::open_with_flags(
+        media_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("打开 media_0.db {:?}", media_db_path))?;
+
+    let has_voice_info: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='VoiceInfo'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !has_voice_info {
+        return Ok(None);
+    }
+
+    let columns = table_columns(&conn, "VoiceInfo")?;
+    if !columns.contains("voice_data") {
+        return Ok(None);
+    }
+    let data_index_expr = if columns.contains("data_index") {
+        "CAST(COALESCE(data_index, '0') AS INTEGER)"
+    } else {
+        "0"
+    };
+    let svr_id_expr = if columns.contains("svr_id") {
+        "svr_id"
+    } else {
+        "NULL"
+    };
+
+    let mut rows = Vec::new();
+
+    if columns.contains("local_id") {
+        if columns.contains("chat_name_id") {
+            let chat_id: Option<i64> = conn
+                .query_row(
+                    "SELECT rowid FROM Name2Id WHERE user_name = ?1",
+                    [chat],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let Some(chat_id) = chat_id else {
+                return Ok(None);
+            };
+
+            if columns.contains("create_time") {
+                rows = query_voice_rows(
+                    &conn,
+                    "chat_name_id = ?1 AND local_id = ?2 AND create_time = ?3",
+                    rusqlite::params![chat_id, local_id, create_time],
+                    data_index_expr,
+                    svr_id_expr,
+                )?;
+            }
+            if rows.is_empty() && !columns.contains("create_time") {
+                rows = query_voice_rows(
+                    &conn,
+                    "chat_name_id = ?1 AND local_id = ?2",
+                    rusqlite::params![chat_id, local_id],
+                    data_index_expr,
+                    svr_id_expr,
+                )?;
+            }
+        }
+    }
+
+    if rows.is_empty() && columns.contains("msgid") {
+        if !columns.contains("user_name") {
+            return Ok(None);
+        }
+        if columns.contains("msgtime") {
+            rows = query_voice_rows(
+                &conn,
+                "user_name = ?1 AND msgid = ?2 AND msgtime = ?3",
+                rusqlite::params![chat, local_id, create_time],
+                data_index_expr,
+                svr_id_expr,
+            )?;
+        }
+        if rows.is_empty() && !columns.contains("msgtime") {
+            rows = query_voice_rows(
+                &conn,
+                "user_name = ?1 AND msgid = ?2",
+                rusqlite::params![chat, local_id],
+                data_index_expr,
+                svr_id_expr,
+            )?;
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    rows.sort_by_key(|row| row.0);
+    let svr_id = rows.iter().find_map(|row| row.2);
+    let chunks = rows.len();
+    let total_len: usize = rows.iter().map(|row| row.1.len()).sum();
+    if total_len == 0 {
+        return Ok(None);
+    }
+    let mut data = Vec::with_capacity(total_len);
+    for (_idx, chunk, _svr_id) in rows {
+        data.extend_from_slice(&chunk);
+    }
+
+    Ok(Some(ResolvedVoiceMedia {
+        data,
+        chunks,
+        svr_id,
+    }))
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(columns)
+}
+
+fn query_voice_rows<P>(
+    conn: &Connection,
+    where_clause: &str,
+    params: P,
+    data_index_expr: &str,
+    svr_id_expr: &str,
+) -> Result<Vec<(i64, Vec<u8>, Option<i64>)>>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "SELECT {data_index_expr} AS voice_index, voice_data, {svr_id_expr} AS voice_svr_id
+         FROM VoiceInfo
+         WHERE {where_clause}
+         ORDER BY voice_index, rowid"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params, |row| {
+            Ok((
+                row.get::<_, i64>(0).unwrap_or(0),
+                row.get::<_, Vec<u8>>(1).unwrap_or_default(),
+                row.get::<_, i64>(2).ok(),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// 从 `MessageResourceInfo.packed_info` (protobuf) 提取 32 字节 ASCII hex md5。
@@ -145,12 +319,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// 在 `<attach_root>/<md5(chat)>/<YYYY-MM>/Img/<md5>[_t|_h].dat` 下找文件。
+/// 在 `<attach_root>/<md5(chat)>/<YYYY-MM>/Img/<md5>[_t|_h].dat` 下找图片文件。
 ///
 /// 优先级：full > `_h`（HD thumbnail）> `_t`（thumbnail）。返回最优的一个；
 /// 找不到返回 None。
@@ -164,17 +336,39 @@ pub fn find_dat_file(
     file_md5: &str,
     create_time: i64,
 ) -> Option<PathBuf> {
+    find_media_file(
+        attach_root,
+        chat,
+        file_md5,
+        create_time,
+        AttachmentKind::Image,
+    )
+}
+
+/// 在本地附件树中定位指定 kind 的媒体文件。
+///
+/// image 走已经验证过的 `Img/<md5>[_h|_t].dat` 规则；voice 是 POC 路径，优先试
+/// `Voice` / `Audio` 目录里的 md5 同名文件，最后在 `msg/attach` 下按 md5 前缀递归兜底。
+pub fn find_media_file(
+    attach_root: &Path,
+    chat: &str,
+    file_md5: &str,
+    create_time: i64,
+    kind: AttachmentKind,
+) -> Option<PathBuf> {
     let chat_hash = format!("{:x}", md5::compute(chat.as_bytes()));
     let chat_dir = attach_root.join(&chat_hash);
     if !chat_dir.is_dir() {
-        return None;
+        return match kind {
+            AttachmentKind::Voice => find_by_md5_recursive(attach_root, file_md5, kind),
+            _ => None,
+        };
     }
 
     // 第一步：试 create_time 当月 + 前后各一个月（共 3 个候选目录）
     let candidates_ym: Vec<String> = three_month_candidates(create_time);
     for ym in &candidates_ym {
-        let img_dir = chat_dir.join(ym).join("Img");
-        if let Some(p) = pick_best_in_img_dir(&img_dir, file_md5) {
+        if let Some(p) = pick_best_in_month_dir(&chat_dir.join(ym), file_md5, kind) {
             return Some(p);
         }
     }
@@ -189,12 +383,37 @@ pub fn find_dat_file(
     // 已经试过的 3 个候选可以跳过，但成本极小；保留全量扫
     all_months.sort();
     for month_dir in all_months {
-        let img_dir = month_dir.join("Img");
-        if let Some(p) = pick_best_in_img_dir(&img_dir, file_md5) {
+        if let Some(p) = pick_best_in_month_dir(&month_dir, file_md5, kind) {
             return Some(p);
         }
     }
-    None
+
+    // POC fallback：Mac 4.x 的语音路径未完全验证。若上面的目录名猜错，仍按资源 md5
+    // 在 attach 树下递归找一次，避免因为 `Voice`/`Audio` 布局差异直接失败。
+    match kind {
+        AttachmentKind::Voice => find_by_md5_recursive(attach_root, file_md5, kind),
+        _ => None,
+    }
+}
+
+fn pick_best_in_month_dir(
+    month_dir: &Path,
+    file_md5: &str,
+    kind: AttachmentKind,
+) -> Option<PathBuf> {
+    match kind {
+        AttachmentKind::Image => pick_best_in_img_dir(&month_dir.join("Img"), file_md5),
+        AttachmentKind::Voice => {
+            for subdir in ["Voice", "Audio", "Aud"] {
+                if let Some(p) = pick_best_media_file(&month_dir.join(subdir), file_md5, kind) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        AttachmentKind::Video => pick_best_media_file(&month_dir.join("Video"), file_md5, kind),
+        AttachmentKind::File => pick_best_media_file(month_dir, file_md5, kind),
+    }
 }
 
 fn pick_best_in_img_dir(img_dir: &Path, file_md5: &str) -> Option<PathBuf> {
@@ -214,6 +433,94 @@ fn pick_best_in_img_dir(img_dir: &Path, file_md5: &str) -> Option<PathBuf> {
         return Some(thumb);
     }
     None
+}
+
+fn pick_best_media_file(media_dir: &Path, file_md5: &str, kind: AttachmentKind) -> Option<PathBuf> {
+    if !media_dir.is_dir() {
+        return None;
+    }
+
+    for name in exact_media_names(file_md5, kind) {
+        let path = media_dir.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = media_dir
+        .read_dir()
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| name.starts_with(file_md5))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|p| {
+        let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+        std::cmp::Reverse(size)
+    });
+    candidates.into_iter().next()
+}
+
+fn exact_media_names(file_md5: &str, kind: AttachmentKind) -> Vec<String> {
+    match kind {
+        AttachmentKind::Image => vec![
+            format!("{}.dat", file_md5),
+            format!("{}_h.dat", file_md5),
+            format!("{}_t.dat", file_md5),
+        ],
+        AttachmentKind::Voice => ["", ".aud", ".amr", ".silk", ".wav", ".m4a", ".mp3", ".dat"]
+            .iter()
+            .map(|ext| format!("{}{}", file_md5, ext))
+            .collect(),
+        AttachmentKind::Video => [".mp4", ".mov", ".m4v", ".dat"]
+            .iter()
+            .map(|ext| format!("{}{}", file_md5, ext))
+            .collect(),
+        AttachmentKind::File => vec![file_md5.to_string()],
+    }
+}
+
+fn find_by_md5_recursive(root: &Path, file_md5: &str, kind: AttachmentKind) -> Option<PathBuf> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name == file_md5
+                || exact_media_names(file_md5, kind).iter().any(|n| n == name)
+                || name.starts_with(file_md5)
+            {
+                matches.push(path);
+            }
+        }
+    }
+    matches.sort_by_key(|p| {
+        let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+        std::cmp::Reverse(size)
+    });
+    matches.into_iter().next()
 }
 
 fn three_month_candidates(unix_ts: i64) -> Vec<String> {
@@ -268,19 +575,26 @@ pub fn resolve_blocking(
             )
         })?;
 
-    let dat_path = find_dat_file(attach_root, &id.chat, &meta.md5, id.create_time).ok_or_else(
-        || {
-            anyhow!(
-                "找不到本地 .dat（md5={} chat={} create_time={}）— 微信可能尚未下载该附件，或附件已被清理",
-                meta.md5,
-                id.chat,
-                id.create_time
-            )
-        },
-    )?;
+    let dat_path =
+        find_media_file(attach_root, &id.chat, &meta.md5, id.create_time, id.kind).ok_or_else(
+            || {
+                anyhow!(
+                    "找不到本地附件文件（kind={} md5={} chat={} create_time={}）— 微信可能尚未下载该附件，或附件已被清理",
+                    id.kind.as_str(),
+                    meta.md5,
+                    id.chat,
+                    id.create_time
+                )
+            },
+        )?;
     let size = std::fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
 
-    Ok(ResolvedAttachment { id: id.clone(), md5: meta.md5, dat_path, size })
+    Ok(ResolvedAttachment {
+        id: id.clone(),
+        md5: meta.md5,
+        dat_path,
+        size,
+    })
 }
 
 #[cfg(test)]
@@ -334,11 +648,8 @@ mod tests {
         let dir = tempdir_for_test();
         let db_path = dir.join("message_resource.db");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE ChatName2Id (user_name TEXT)",
-            [],
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO ChatName2Id (rowid, user_name) VALUES (1, 'room@chatroom')",
             [],
@@ -393,6 +704,208 @@ mod tests {
     }
 
     #[test]
+    fn lookup_voice_media_reads_chunks_from_media_db() {
+        let dir = tempdir_for_test();
+        let db_path = dir.join("media_0.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id (rowid, user_name) VALUES (9, 'room@chatroom')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                create_time INTEGER,
+                local_id INTEGER,
+                svr_id INTEGER,
+                voice_data BLOB,
+                data_index TEXT DEFAULT '0'
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO VoiceInfo
+             (chat_name_id, create_time, local_id, svr_id, voice_data, data_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![9i64, 2000i64, 7i64, 123i64, b"two", "2"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO VoiceInfo
+             (chat_name_id, create_time, local_id, svr_id, voice_data, data_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![9i64, 2000i64, 7i64, 123i64, b"one", "1"],
+        )
+        .unwrap();
+
+        let media = lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(media.data, b"onetwo");
+        assert_eq!(media.chunks, 2);
+        assert_eq!(media.svr_id, Some(123));
+    }
+
+    #[test]
+    fn lookup_voice_media_keeps_rows_scoped_to_chat() {
+        let dir = tempdir_for_test();
+        let db_path = dir.join("media_0.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id (rowid, user_name) VALUES (9, 'room@chatroom')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id (rowid, user_name) VALUES (10, 'other@chatroom')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                create_time INTEGER,
+                local_id INTEGER,
+                svr_id INTEGER,
+                voice_data BLOB,
+                data_index TEXT DEFAULT '0'
+            )",
+            [],
+        )
+        .unwrap();
+        for (chat_id, data) in [(10i64, b"wrong".as_slice()), (9i64, b"right".as_slice())] {
+            conn.execute(
+                "INSERT INTO VoiceInfo
+                 (chat_name_id, create_time, local_id, svr_id, voice_data, data_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![chat_id, 2000i64, 7i64, 123i64, data, "0"],
+            )
+            .unwrap();
+        }
+
+        let media = lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(media.data, b"right");
+    }
+
+    #[test]
+    fn lookup_voice_media_uses_create_time_to_disambiguate_reused_local_id() {
+        let dir = tempdir_for_test();
+        let db_path = dir.join("media_0.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id (rowid, user_name) VALUES (9, 'room@chatroom')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                create_time INTEGER,
+                local_id INTEGER,
+                svr_id INTEGER,
+                voice_data BLOB,
+                data_index TEXT DEFAULT '0'
+            )",
+            [],
+        )
+        .unwrap();
+        for (create_time, data) in [(1000i64, b"old".as_slice()), (2000i64, b"new".as_slice())] {
+            conn.execute(
+                "INSERT INTO VoiceInfo
+                 (chat_name_id, create_time, local_id, svr_id, voice_data, data_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![9i64, create_time, 7i64, 123i64, data, "0"],
+            )
+            .unwrap();
+        }
+
+        let media = lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(media.data, b"new");
+        assert!(
+            lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 3000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lookup_voice_media_reads_legacy_schema_without_chunk_columns() {
+        let dir = tempdir_for_test();
+        let db_path = dir.join("media_0.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                user_name TEXT,
+                msgid INTEGER,
+                msgtime INTEGER,
+                voice_data BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO VoiceInfo (user_name, msgid, msgtime, voice_data)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["room@chatroom", 7i64, 2000i64, b"voice"],
+        )
+        .unwrap();
+
+        let media = lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(media.data, b"voice");
+        assert_eq!(media.chunks, 1);
+        assert_eq!(media.svr_id, None);
+    }
+
+    #[test]
+    fn lookup_voice_media_legacy_schema_uses_msgtime_to_disambiguate_reused_msgid() {
+        let dir = tempdir_for_test();
+        let db_path = dir.join("media_0.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                user_name TEXT,
+                msgid INTEGER,
+                msgtime INTEGER,
+                voice_data BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        for (msgtime, data) in [(1000i64, b"old".as_slice()), (2000i64, b"new".as_slice())] {
+            conn.execute(
+                "INSERT INTO VoiceInfo (user_name, msgid, msgtime, voice_data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["room@chatroom", 7i64, msgtime, data],
+            )
+            .unwrap();
+        }
+
+        let media = lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(media.data, b"new");
+        assert!(
+            lookup_voice_media_blocking(&db_path, "room@chatroom", 7, 3000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn three_month_candidates_includes_prev_curr_next() {
         // 2025-08-15 (mid-month) → 2025-07, 2025-08, 2025-09
         let ts = chrono::Local
@@ -415,15 +928,56 @@ mod tests {
         std::fs::write(img.join(format!("{}_h.dat", md5)), b"hd").unwrap();
         // 只有 _t / _h 时取 _h
         assert_eq!(
-            pick_best_in_img_dir(&img, md5).unwrap().file_name().unwrap(),
+            pick_best_in_img_dir(&img, md5)
+                .unwrap()
+                .file_name()
+                .unwrap(),
             format!("{}_h.dat", md5).as_str()
         );
         // 加 full 后取 full
         std::fs::write(img.join(format!("{}.dat", md5)), b"full").unwrap();
         assert_eq!(
-            pick_best_in_img_dir(&img, md5).unwrap().file_name().unwrap(),
+            pick_best_in_img_dir(&img, md5)
+                .unwrap()
+                .file_name()
+                .unwrap(),
             format!("{}.dat", md5).as_str()
         );
+    }
+
+    #[test]
+    fn find_media_file_finds_voice_by_month_voice_dir() {
+        let tmp = tempdir_for_test();
+        let chat = "room@chatroom";
+        let chat_hash = format!("{:x}", md5::compute(chat.as_bytes()));
+        let ts = chrono::Local
+            .with_ymd_and_hms(2026, 6, 9, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let voice_dir = tmp.join(chat_hash).join("2026-06").join("Voice");
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        let md5 = "00112233445566778899aabbccddeeff";
+        std::fs::write(voice_dir.join(format!("{}.aud", md5)), b"voice").unwrap();
+
+        let found = find_media_file(&tmp, chat, md5, ts, AttachmentKind::Voice).unwrap();
+        assert_eq!(found.file_name().unwrap(), format!("{}.aud", md5).as_str());
+    }
+
+    #[test]
+    fn find_media_file_voice_recurses_when_layout_unknown() {
+        let tmp = tempdir_for_test();
+        let chat = "room@chatroom";
+        let ts = chrono::Local
+            .with_ymd_and_hms(2026, 6, 9, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let odd_dir = tmp.join("somehash").join("2026-06").join("NotVoice");
+        std::fs::create_dir_all(&odd_dir).unwrap();
+        let md5 = "abcdefabcdefabcdefabcdefabcdefab";
+        std::fs::write(odd_dir.join(format!("{}.silk", md5)), b"voice").unwrap();
+
+        let found = find_media_file(&tmp, chat, md5, ts, AttachmentKind::Voice).unwrap();
+        assert_eq!(found.file_name().unwrap(), format!("{}.silk", md5).as_str());
     }
 
     fn tempdir_for_test() -> PathBuf {

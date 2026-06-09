@@ -155,11 +155,11 @@ pub enum Request {
     },
     /// 重新加载配置和密钥（init --force 后 daemon 不会自动重读）
     ReloadConfig,
-    /// 列出某个会话里的图片附件
+    /// 列出某个会话里的附件
     /// 输出每条带 `attachment_id`（不透明 base64url 句柄），传给 `Extract` 时取回本体
     Attachments {
         chat: String,
-        /// 类型过滤：当前仅支持 image
+        /// 类型过滤：默认 image；POC 支持 voice/audio
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kinds: Option<Vec<String>>,
         #[serde(default = "default_limit_50")]
@@ -175,7 +175,7 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         debug_source: bool,
     },
-    /// 提取（解密）单个附件的本体到指定路径
+    /// 提取单个附件的本体到指定路径；图片解码，语音 POC 原样复制
     Extract {
         /// `Attachments` 返回的不透明 ID
         attachment_id: String,

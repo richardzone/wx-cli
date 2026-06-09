@@ -925,7 +925,8 @@ fn query_messages(
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
-        let sender_username = sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
+        let sender_username =
+            sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
         let sender = sender_label(
             real_sender_id,
             &content,
@@ -946,7 +947,13 @@ fn query_messages(
             "type": fmt_type(local_type),
             "local_id": local_id,
         });
-        add_sender_identity(&mut msg, is_group, &sender_username, names_map, group_nicknames);
+        add_sender_identity(
+            &mut msg,
+            is_group,
+            &sender_username,
+            names_map,
+            group_nicknames,
+        );
         if let Some(u) = url {
             msg["url"] = serde_json::Value::String(u);
         }
@@ -1032,7 +1039,8 @@ fn search_in_table(
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
-        let sender_username = sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
+        let sender_username =
+            sender_username(real_sender_id, &content, is_group, chat_username, &id2u);
         let sender = sender_label(
             real_sender_id,
             &content,
@@ -1057,7 +1065,13 @@ fn search_in_table(
             "content": text,
             "type": fmt_type(local_type),
         });
-        add_sender_identity(&mut msg, is_group, &sender_username, names_map, group_nicknames);
+        add_sender_identity(
+            &mut msg,
+            is_group,
+            &sender_username,
+            names_map,
+            group_nicknames,
+        );
         if let Some(u) = url {
             msg["url"] = serde_json::Value::String(u);
         }
@@ -1558,11 +1572,13 @@ fn add_sender_identity(
     }
     row["sender_username"] = Value::String(username.to_string());
     row["sender_contact_display"] = Value::String(
-        names.get(username).cloned().unwrap_or_else(|| username.to_string())
+        names
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| username.to_string()),
     );
-    row["sender_group_nickname"] = Value::String(
-        group_nicknames.get(username).cloned().unwrap_or_default()
-    );
+    row["sender_group_nickname"] =
+        Value::String(group_nicknames.get(username).cloned().unwrap_or_default());
 }
 
 fn sender_label(
@@ -2193,14 +2209,7 @@ mod appmsg_tests {
             .expect("create message table");
             conn.execute(
                 "INSERT INTO Msg_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    1_i64,
-                    1_i64,
-                    1775146911_i64,
-                    42_i64,
-                    "hello",
-                    0_i64
-                ],
+                rusqlite::params![1_i64, 1_i64, 1775146911_i64, 42_i64, "hello", 0_i64],
             )
             .expect("insert text message");
         }
@@ -2227,7 +2236,10 @@ mod appmsg_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["sender"].as_str(), Some("同名"));
         assert_eq!(rows[0]["sender_username"].as_str(), Some("wxid_alice"));
-        assert_eq!(rows[0]["sender_contact_display"].as_str(), Some("Alice Contact"));
+        assert_eq!(
+            rows[0]["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
         assert_eq!(rows[0]["sender_group_nickname"].as_str(), Some("同名"));
     }
 
@@ -2284,7 +2296,10 @@ mod appmsg_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["sender"].as_str(), Some("同名"));
         assert_eq!(rows[0]["sender_username"].as_str(), Some("wxid_alice"));
-        assert_eq!(rows[0]["sender_contact_display"].as_str(), Some("Alice Contact"));
+        assert_eq!(
+            rows[0]["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
         assert_eq!(rows[0]["sender_group_nickname"].as_str(), Some("同名"));
     }
 
@@ -2314,7 +2329,10 @@ mod appmsg_tests {
         add_sender_identity(&mut alice_row, true, "wxid_alice", &names, &group_nicknames);
         assert_eq!(alice_row["sender"].as_str(), Some("同名"));
         assert_eq!(alice_row["sender_username"].as_str(), Some("wxid_alice"));
-        assert_eq!(alice_row["sender_contact_display"].as_str(), Some("Alice Contact"));
+        assert_eq!(
+            alice_row["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
         assert_eq!(alice_row["sender_group_nickname"].as_str(), Some("同名"));
 
         let mut bob_row = json!({
@@ -2336,7 +2354,13 @@ mod appmsg_tests {
 
         // 非群 chat 不该追加 identity 字段（行为对齐 history/search/new-messages）
         let mut private_row = json!({"attachment_id": "ghi", "sender": ""});
-        add_sender_identity(&mut private_row, false, "wxid_alice", &names, &group_nicknames);
+        add_sender_identity(
+            &mut private_row,
+            false,
+            "wxid_alice",
+            &names,
+            &group_nicknames,
+        );
         assert!(private_row.get("sender_username").is_none());
         assert!(private_row.get("sender_contact_display").is_none());
         assert!(private_row.get("sender_group_nickname").is_none());
@@ -2992,7 +3016,8 @@ pub async fn q_new_messages(
                 let mut result = Vec::new();
                 for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
                     let content = decompress_message(&content_bytes, ct);
-                    let sender_username = sender_username(real_sender_id, &content, is_group, &uname2, &id2u);
+                    let sender_username =
+                        sender_username(real_sender_id, &content, is_group, &uname2, &id2u);
                     let sender = sender_label(
                         real_sender_id,
                         &content,
@@ -3015,7 +3040,13 @@ pub async fn q_new_messages(
                         "content": text,
                         "type": fmt_type(local_type),
                     });
-                    add_sender_identity(&mut msg, is_group, &sender_username, &names_map, &group_nicknames2);
+                    add_sender_identity(
+                        &mut msg,
+                        is_group,
+                        &sender_username,
+                        &names_map,
+                        &group_nicknames2,
+                    );
                     if let Some(u) = url {
                         msg["url"] = serde_json::Value::String(u);
                     }
@@ -4393,18 +4424,21 @@ pub async fn q_attachments(
                                     &names_map,
                                     &group_nicknames2,
                                 ),
-                                sender_username(
-                                    real_sender_id,
-                                    &content,
-                                    true,
-                                    &uname,
-                                    &id2u,
-                                ),
+                                sender_username(real_sender_id, &content, true, &uname, &id2u),
                             )
                         } else {
                             (String::new(), String::new())
                         };
-                        Ok((local_id, lo32, ts, real_sender_id, sender, sender_uname, ts, db_idx2))
+                        Ok((
+                            local_id,
+                            lo32,
+                            ts,
+                            real_sender_id,
+                            sender,
+                            sender_uname,
+                            ts,
+                            db_idx2,
+                        ))
                     })?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -4449,7 +4483,13 @@ pub async fn q_attachments(
         if is_group && !sender.is_empty() {
             row["sender"] = Value::String(sender);
         }
-        add_sender_identity(&mut row, is_group, &sender_uname, &names.map, &group_nicknames);
+        add_sender_identity(
+            &mut row,
+            is_group,
+            &sender_uname,
+            &names.map,
+            &group_nicknames,
+        );
         results.push(row);
     }
     let unknown_shards = current_unknown_shards(db, names);
@@ -4476,7 +4516,9 @@ pub async fn q_attachments(
     }))
 }
 
-/// 解码 attachment_id → 查 message_resource.db → 找本地 .dat → 解密 → 写盘。
+/// 解码 attachment_id → 写出附件资源。
+/// image: message_resource.db → 本地 .dat → 解码。
+/// voice POC: 优先 media_0.db::VoiceInfo → 原样写出 SILK/音频 bytes；未命中再走资源文件 fallback。
 pub async fn q_extract(
     db: &DbCache,
     _names: &Names,
@@ -4487,7 +4529,7 @@ pub async fn q_extract(
     use crate::attachment::{
         attachment_id::AttachmentId,
         decoder::{self, V2KeyMaterial},
-        image_key, resolver,
+        image_key, resolver, AttachmentKind,
     };
 
     let id = AttachmentId::decode(attachment_id)
@@ -4505,6 +4547,44 @@ pub async fn q_extract(
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("创建输出目录失败：{}", parent.display()))?;
+        }
+    }
+
+    if id.kind == AttachmentKind::Voice {
+        if let Some(media_path) = db.get("message/media_0.db").await? {
+            let id_for_task = id.clone();
+            let output_path2 = output_path.clone();
+            let report = tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
+                let Some(voice) = resolver::lookup_voice_media_blocking(
+                    &media_path,
+                    &id_for_task.chat,
+                    id_for_task.local_id,
+                    id_for_task.create_time,
+                )?
+                else {
+                    return Ok(None);
+                };
+
+                std::fs::write(&output_path2, &voice.data)
+                    .with_context(|| format!("写出文件失败：{}", output_path2.display()))?;
+                Ok(Some(json!({
+                    "kind": id_for_task.kind.as_str(),
+                    "source": "message/media_0.db",
+                    "local_id": id_for_task.local_id,
+                    "create_time": id_for_task.create_time,
+                    "chunks": voice.chunks,
+                    "svr_id": voice.svr_id,
+                    "output": output_path2.display().to_string(),
+                    "output_size": voice.data.len(),
+                    "format": raw_media_format(&output_path2, &voice.data),
+                    "decoder": "media_0_voice_data",
+                    "poc": true,
+                })))
+            })
+            .await??;
+            if let Some(report) = report {
+                return Ok(report);
+            }
         }
     }
 
@@ -4534,6 +4614,22 @@ pub async fn q_extract(
 
         let dat_bytes = std::fs::read(&resolved.dat_path)
             .with_context(|| format!("读取 .dat 失败：{}", resolved.dat_path.display()))?;
+
+        if id_for_task.kind != AttachmentKind::Image {
+            std::fs::write(&output_path2, &dat_bytes)
+                .with_context(|| format!("写出文件失败：{}", output_path2.display()))?;
+            return Ok(json!({
+                "kind": id_for_task.kind.as_str(),
+                "md5": resolved.md5,
+                "dat_path": resolved.dat_path.display().to_string(),
+                "dat_size": resolved.size,
+                "output": output_path2.display().to_string(),
+                "output_size": dat_bytes.len(),
+                "format": raw_media_format(&resolved.dat_path, &dat_bytes),
+                "decoder": "raw_copy",
+                "poc": true,
+            }));
+        }
 
         // V2 image key — 平台相关。`ImageKeyMaterial` 同时给 aes_key + xor_key。
         // xor_key 不能硬编码 0x88：实测 macOS 真实账号上是 `uin & 0xff` 派生的（0xa2 等），
@@ -4599,7 +4695,7 @@ pub async fn q_extract(
 }
 
 /// 解析 `kinds` 参数到 `(AttachmentKind, lo32_local_type)` 列表。
-/// 当前只支持 image；命令名保留成 `attachments` 是为了后续扩到其他附件类型时不 break CLI。
+/// 默认 image；voice/audio 是 POC：可以枚举并 raw-copy 本地语音文件，但不做转码/转写。
 fn parse_attachment_kinds(
     kinds: Option<&[String]>,
 ) -> Result<Vec<(crate::attachment::AttachmentKind, i64)>> {
@@ -4613,12 +4709,13 @@ fn parse_attachment_kinds(
     for k in raw {
         let (kind, t): (AttachmentKind, i64) = match k.to_ascii_lowercase().as_str() {
             "image" | "img" => (AttachmentKind::Image, 3),
-            "voice" | "audio" | "video" | "file" => {
+            "voice" | "audio" => (AttachmentKind::Voice, 34),
+            "video" | "file" => {
                 anyhow::bail!(
-                    "当前只支持 image 提取；video/file/voice 的资源路径与 decoder 还没接通"
+                    "当前只支持 image 和 voice POC；video/file 的资源路径与 decoder 还没接通"
                 )
             }
-            other => anyhow::bail!("未知附件类型：{}（当前仅支持 image）", other),
+            other => anyhow::bail!("未知附件类型：{}（当前支持 image / voice POC）", other),
         };
         if seen.insert(kind.as_str()) {
             out.push((kind, t));
@@ -4627,9 +4724,74 @@ fn parse_attachment_kinds(
     Ok(out)
 }
 
+fn raw_media_format(path: &std::path::Path, bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"#!SILK")
+        || bytes
+            .windows(b"#!SILK".len())
+            .take(8)
+            .any(|chunk| chunk == b"#!SILK")
+    {
+        return "silk";
+    }
+    if bytes.starts_with(b"#!AMR") {
+        return "amr";
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return "wav";
+    }
+    if bytes.starts_with(b"ID3") || bytes.starts_with(&[0xFF, 0xFB]) {
+        return "mp3";
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return "m4a";
+    }
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+    {
+        "aud" => "aud",
+        "amr" => "amr",
+        "silk" => "silk",
+        "wav" => "wav",
+        "m4a" => "m4a",
+        "mp3" => "mp3",
+        "dat" => "dat",
+        _ => "bin",
+    }
+}
+
 #[cfg(test)]
 mod biz_tests {
     use super::*;
+
+    #[test]
+    fn parse_attachment_kinds_accepts_voice_aliases() {
+        let kinds = vec!["voice".to_string(), "audio".to_string()];
+        let parsed = parse_attachment_kinds(Some(&kinds)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.as_str(), "voice");
+        assert_eq!(parsed[0].1, 34);
+    }
+
+    #[test]
+    fn raw_media_format_detects_common_audio_headers() {
+        assert_eq!(
+            raw_media_format(std::path::Path::new("x.bin"), b"#!SILK_V3"),
+            "silk"
+        );
+        assert_eq!(
+            raw_media_format(std::path::Path::new("x.aud"), b"\x02#!SILK_V3"),
+            "silk"
+        );
+        assert_eq!(
+            raw_media_format(std::path::Path::new("x.bin"), b"#!AMR\n"),
+            "amr"
+        );
+        let mut wav = b"RIFF0000WAVE".to_vec();
+        wav.extend_from_slice(&[0; 8]);
+        assert_eq!(raw_media_format(std::path::Path::new("x.bin"), &wav), "wav");
+    }
 
     #[test]
     fn extract_cdata_normal() {
@@ -4837,12 +4999,18 @@ mod group_nickname_tests {
         assert_eq!(top.len(), 2);
         assert_eq!(top[0]["sender"].as_str(), Some("同名"));
         assert_eq!(top[0]["sender_username"].as_str(), Some("wxid_alice"));
-        assert_eq!(top[0]["sender_contact_display"].as_str(), Some("Alice Contact"));
+        assert_eq!(
+            top[0]["sender_contact_display"].as_str(),
+            Some("Alice Contact")
+        );
         assert_eq!(top[0]["sender_group_nickname"].as_str(), Some("同名"));
         assert_eq!(top[0]["count"].as_i64(), Some(7));
         assert_eq!(top[1]["sender"].as_str(), Some("同名"));
         assert_eq!(top[1]["sender_username"].as_str(), Some("wxid_bob"));
-        assert_eq!(top[1]["sender_contact_display"].as_str(), Some("Bob Contact"));
+        assert_eq!(
+            top[1]["sender_contact_display"].as_str(),
+            Some("Bob Contact")
+        );
         assert_eq!(top[1]["sender_group_nickname"].as_str(), Some("同名"));
         assert_eq!(top[1]["count"].as_i64(), Some(3));
     }

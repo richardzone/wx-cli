@@ -8,7 +8,8 @@ use crate::ipc::Request;
 /// `wx attachments` — 列出指定会话的附件消息（默认 image，可多选）。
 ///
 /// 输出每条 `attachment_id`，再传给 `wx extract` 才真正读 message_resource.db
-/// 与本地 .dat 解码。这一步只查 `Msg_<chat>` 表，几千条群聊也能秒返。
+/// 与本地资源文件。POC 中 image 解码，voice/audio 原样复制；这一步只查
+/// `Msg_<chat>` 表，几千条群聊也能秒返。
 pub fn cmd_attachments(
     chat: String,
     kinds: Vec<String>,

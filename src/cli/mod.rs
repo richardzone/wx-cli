@@ -16,12 +16,14 @@ pub mod sns_feed;
 pub mod sns_notifications;
 pub mod sns_search;
 pub mod stats;
+pub mod transcribe;
 pub mod transport;
 pub mod unread;
 
 use self::output::OutputOpts;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// wx — 微信本地数据 CLI
 #[derive(Parser)]
@@ -271,13 +273,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// 列出某会话的图片附件，返回不透明 attachment_id
+    /// 列出某会话的附件，返回不透明 attachment_id
     Attachments {
         /// 会话名称（联系人显示名 / wxid / @chatroom username 都可以）
         chat: String,
-        /// 类型（当前仅支持 image）
+        /// 类型（POC 支持 image / voice）
         #[arg(long = "kind", value_name = "KIND",
-              value_parser = ["image", "img"])]
+              value_parser = ["image", "img", "voice", "audio"])]
         kinds: Vec<String>,
         /// 显示数量
         #[arg(short = 'n', long, default_value = "50")]
@@ -295,16 +297,42 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// 把单个 attachment_id 对应的资源解密写到指定文件路径
+    /// 把单个 attachment_id 对应的资源写到指定文件路径
     Extract {
         /// 由 `wx attachments` 输出的不透明 ID（base64url 字符串）
         attachment_id: String,
-        /// 输出文件路径（绝对或相对当前工作目录均可；扩展名建议保留为 .jpg 等）
+        /// 输出文件路径（图片建议 .jpg/.png；语音 POC 建议先保留原始扩展名）
         #[arg(short = 'o', long)]
         output: String,
         /// 目标已存在时覆盖
         #[arg(long)]
         overwrite: bool,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
+    /// 转写单个语音 attachment_id（SILK -> WAV -> whisper.cpp）
+    Transcribe {
+        /// 由 `wx attachments --kind voice` 输出的不透明 ID（base64url 字符串）
+        attachment_id: String,
+        /// whisper.cpp 模型路径；也可用 WX_WHISPER_MODEL
+        #[arg(long, value_name = "PATH")]
+        model: Option<PathBuf>,
+        /// whisper.cpp 的 whisper-cli 路径；默认找 WX_WHISPER_BIN 或 PATH 里的 whisper-cli
+        #[arg(long = "whisper-bin", value_name = "PATH")]
+        whisper_bin: Option<PathBuf>,
+        /// SILK v3 decoder 路径；默认找 WX_SILK_DECODER 或 PATH 里的 silk-decoder/silk_v3_decoder/silk_decoder
+        #[arg(long = "silk-decoder", value_name = "PATH")]
+        silk_decoder: Option<PathBuf>,
+        /// ffmpeg 路径；默认找 WX_FFMPEG 或 PATH 里的 ffmpeg
+        #[arg(long, value_name = "PATH")]
+        ffmpeg: Option<PathBuf>,
+        /// 语音语言，传给 whisper.cpp -l；普通话建议 zh，自动识别用 auto
+        #[arg(short = 'l', long = "language", default_value = "zh")]
+        language: String,
+        /// 保留中间文件（raw/silk/pcm/wav），用于调试转码质量；目录权限保持 0700
+        #[arg(long)]
+        keep_temp: bool,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -520,6 +548,25 @@ fn dispatch(cli: Cli) -> Result<()> {
             overwrite,
             json,
         } => extract::cmd_extract(attachment_id, output, overwrite, json),
+        Commands::Transcribe {
+            attachment_id,
+            model,
+            whisper_bin,
+            silk_decoder,
+            ffmpeg,
+            language,
+            keep_temp,
+            json,
+        } => transcribe::cmd_transcribe(
+            attachment_id,
+            model,
+            whisper_bin,
+            silk_decoder,
+            ffmpeg,
+            language,
+            keep_temp,
+            json,
+        ),
         Commands::Daemon { cmd } => daemon_cmd::cmd_daemon(cmd),
     }
 }

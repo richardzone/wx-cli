@@ -267,24 +267,42 @@ wx biz-articles --since 2026-05-10 --json | jq '.[].url'
 
 每条返回的字段：`account` / `account_username`（`gh_*`）/ `title` / `url`（`mp.weixin.qq.com` 链接）/ `digest` / `cover_url` / `time` + `timestamp`（文章发布时间）/ `recv_time_str` + `recv_time`（微信接收推送的时间）。多图文推送会展开为多行。
 
-### 附件提取（图片）
+### 附件提取（图片；语音 POC）
 
-聊天里的图片本体在 `xwechat_files/<wxid>/msg/attach/...` 下加密存储（`.dat`），需要按消息所在 `message_resource.db` 的 md5 + 平台相关 image key 才能解码。两步走：
+聊天里的附件本体存在本地数据库或 `xwechat_files/<wxid>/msg/attach/...` 下的资源文件。图片需要按消息所在 `message_resource.db` 的 md5 + 平台相关 image key 解码才能拿到原图；语音目前是 POC，优先从 `message/media_0.db::VoiceInfo` 导出 `voice_data`，未命中时再尝试本地文件缓存，只做原样复制，不做转码或转文字。
 
 ```bash
-# 1) 先列出图片附件，拿到不透明的 attachment_id
+# 1) 先列出附件，拿到不透明的 attachment_id
 wx attachments "张三"
 wx attachments "AI群" --kind image -n 100
 wx attachments "AI群" --since 2026-04-01 --until 2026-04-15
 
-# 2) 用 attachment_id 把单个资源解密写到指定路径
+# POC: 列出语音消息资源
+wx attachments "张三" --kind voice -n 20
+
+# 2) 用 attachment_id 把单个资源写到指定路径
 wx extract <attachment_id> -o ~/Desktop/photo.jpg
+wx extract <voice_attachment_id> -o /tmp/voice.aud
 wx extract <attachment_id> -o /tmp/x.jpg --overwrite
 ```
 
-`attachments` 输出每条带：`attachment_id` / `kind`（当前固定 `image`）/ `type` / `local_id` / `timestamp` / `time`，群聊里另带 `sender` 和稳定身份三件套（同上文）。命令名保留成 `attachments` 是为了后续扩到其他附件类型时不 break CLI。
+`attachments` 输出每条带：`attachment_id` / `kind` / `type` / `local_id` / `timestamp` / `time`，群聊里另带 `sender` 和稳定身份三件套（同上文）。默认 `kind` 是 `image`；`--kind voice` / `--kind audio` 是 POC，优先从 `message/media_0.db::VoiceInfo` 导出 `voice_data`，未命中时再尝试本地文件缓存，只做原样复制，不做转码或转文字。
 
-`extract` 报告里带：`md5` / `dat_path` / `dat_size` / `output` / `output_size` / `format`（实际识别出的图片格式：jpg / png / gif / webp / hevc 等）/ `decoder`（实际选用的解码器：`legacy_xor` / `v1_aes` / `v2`）。
+`extract` 报告里带：`output` / `output_size` / `format` / `decoder`；从本地附件文件命中时还带 `md5` / `dat_path` / `dat_size`。图片的 `decoder` 是 `legacy_xor` / `v1_aes` / `v2`；语音 POC 的 `decoder` 是 `media_0_voice_data` 或 `raw_copy`。
+
+#### 语音转文字 POC
+
+`wx transcribe` 会把语音 `attachment_id` 走完整本地链路：导出 WeChat 原始语音 bytes → SILK v3 decoder 转 PCM → `ffmpeg` 转 16k mono WAV → `whisper.cpp` 本地 ASR。wx-cli 不内置模型，也不下载依赖；所有工具都在本机执行。`--keep-temp` 会保留中间音频文件，目录权限保持 `0700`，但这些文件仍然是私密语音数据，只应在调试时使用。
+
+```bash
+wx transcribe <voice_attachment_id> \
+  --silk-decoder /path/to/silk-v3-decoder/silk/decoder \
+  --whisper-bin /path/to/whisper.cpp/build/bin/whisper-cli \
+  --model /path/to/whisper.cpp/models/ggml-large-v3-turbo.bin \
+  --language zh
+```
+
+也可用环境变量减少参数：`WX_SILK_DECODER` / `WX_WHISPER_BIN` / `WX_WHISPER_MODEL` / `WX_FFMPEG`。
 
 支持的解码档位：
 - **legacy XOR**：早期单字节 XOR，无 magic（按文件首字节探测格式自动反推）
