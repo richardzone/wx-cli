@@ -4483,6 +4483,7 @@ pub async fn q_extract(
     attachment_id: &str,
     output: &str,
     overwrite: bool,
+    raw: bool,
 ) -> Result<Value> {
     use crate::attachment::{
         attachment_id::AttachmentId,
@@ -4573,25 +4574,63 @@ pub async fn q_extract(
         };
 
         let decoded = decoder::dispatch(&dat_bytes, v2_key)?;
+        let source_format = decoded.format;
+        let source_size = decoded.data.len();
+        let mut output_format = source_format.to_string();
+        let mut decoder_name = decoded.decoder.to_string();
+        let mut output_data = decoded.data;
+        let mut wxgf_partition_offset: Option<usize> = None;
+        let mut wxgf_partition_size: Option<usize> = None;
+        let mut wxgf_partition_ratio: Option<f64> = None;
+        let mut transcoder: Option<String> = None;
+
+        if source_format == "hevc" && !raw {
+            let jpg = decoder::wxgf::transcode_to_jpeg(&output_data)
+                .context("WXGF/HEVC 图片转 JPG 失败；可安装 ffmpeg 或用 wx extract --raw 导出原始 WXGF")?;
+            wxgf_partition_offset = Some(jpg.partition.offset);
+            wxgf_partition_size = Some(jpg.partition.size);
+            wxgf_partition_ratio = Some(jpg.partition.ratio);
+            transcoder = Some(format!("ffmpeg:{}", jpg.ffmpeg));
+            output_data = jpg.data;
+            output_format = "jpg".to_string();
+            decoder_name.push_str("+wxgf_ffmpeg");
+        }
 
         // 写盘
-        std::fs::write(&output_path2, &decoded.data)
+        std::fs::write(&output_path2, &output_data)
             .with_context(|| format!("写出文件失败：{}", output_path2.display()))?;
 
         // 注意：不要在这里塞 `ok: true`。dispatch 会用 Response::ok(v) 包一层，
         // Response 的 `data: Value` 字段是 #[serde(flatten)] 写出的，本 payload
         // 的 `ok` 会和 Response 自带的 `ok` 在线上拼成两个同名 key，CLI 反序列化时
         // serde_json 直接报 "duplicate field"，业务请求看上去像 daemon 解析失败。
-        Ok(json!({
+        let mut report = json!({
             "kind": id_for_task.kind.as_str(),
             "md5": resolved.md5,
             "dat_path": resolved.dat_path.display().to_string(),
             "dat_size": resolved.size,
             "output": output_path2.display().to_string(),
-            "output_size": decoded.data.len(),
-            "format": decoded.format,
-            "decoder": decoded.decoder,
-        }))
+            "output_size": output_data.len(),
+            "format": output_format,
+            "decoder": decoder_name,
+        });
+        if source_format != report["format"].as_str().unwrap_or_default() {
+            report["source_format"] = json!(source_format);
+            report["source_size"] = json!(source_size);
+        }
+        if let Some(transcoder) = transcoder {
+            report["transcoder"] = json!(transcoder);
+        }
+        if let Some(offset) = wxgf_partition_offset {
+            report["wxgf_partition_offset"] = json!(offset);
+        }
+        if let Some(size) = wxgf_partition_size {
+            report["wxgf_partition_size"] = json!(size);
+        }
+        if let Some(ratio) = wxgf_partition_ratio {
+            report["wxgf_partition_ratio"] = json!(ratio);
+        }
+        Ok(report)
     })
     .await??;
 

@@ -305,6 +305,9 @@ enum Commands {
         /// 目标已存在时覆盖
         #[arg(long)]
         overwrite: bool,
+        /// 原样导出解码后的附件数据；WXGF/HEVC 图片不转 JPG
+        #[arg(long)]
+        raw: bool,
         /// 输出 JSON（默认 YAML）
         #[arg(long)]
         json: bool,
@@ -518,8 +521,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             attachment_id,
             output,
             overwrite,
+            raw,
             json,
-        } => extract::cmd_extract(attachment_id, output, overwrite, json),
+        } => extract::cmd_extract(attachment_id, output, overwrite, raw, json),
         Commands::Daemon { cmd } => daemon_cmd::cmd_daemon(cmd),
     }
 }
