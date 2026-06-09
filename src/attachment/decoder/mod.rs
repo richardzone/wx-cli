@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 
 pub mod v1_xor;
 pub mod v2;
+pub mod wxgf;
 
 /// 完整 V2 magic：`\x07\x08V2\x08\x07`
 pub const V2_MAGIC: [u8; 6] = [0x07, 0x08, b'V', b'2', 0x08, 0x07];

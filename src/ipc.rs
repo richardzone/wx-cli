@@ -184,6 +184,9 @@ pub enum Request {
         /// 已存在时是否覆盖
         #[serde(default)]
         overwrite: bool,
+        /// 原样导出解码后的附件数据；图片为 WXGF/HEVC 时不调用 ffmpeg 转 JPG
+        #[serde(default, skip_serializing_if = "is_false")]
+        raw: bool,
     },
 }
 

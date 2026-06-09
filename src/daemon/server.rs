@@ -353,7 +353,8 @@ async fn dispatch(req: Request, db: &DbCache, names: &tokio::sync::RwLock<Arc<Na
             attachment_id,
             output,
             overwrite,
-        } => match query::q_extract(db, &names_arc, &attachment_id, &output, overwrite).await {
+            raw,
+        } => match query::q_extract(db, &names_arc, &attachment_id, &output, overwrite, raw).await {
             Ok(v) => Response::ok(v),
             Err(e) => Response::err(e.to_string()),
         },
